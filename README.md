@@ -42,9 +42,14 @@ a09d33b7        3d             term      Fix flaky upload test     ~/develop/api
   in a terminal right now (`run:idle`, `run:busy`) or running
   in the background (`bg`).
 - **Filter and sort.** Free text query over title, path, branch
-  and first prompt. `--named` / `--unnamed`, `--app` / `--term`,
-  `--here`, `--sort active|started|name|dir|msgs|size|cost`.
-- **Resume from anywhere.** `claudes r api-refactor` changes
+  and prompts. `--named` / `--unnamed`, `--app` / `--term`,
+  `--dir` / `--under` / `--here`, `--older 30d` / `--newer 2h`,
+  `--sort active|started|name|dir|msgs|size|cost`.
+- **Act on many at once.** `-q` prints ids, `-` reads them back:
+  `claudes --unnamed --older 30d -q | claudes rm -`. `rm` also
+  takes the filters directly. `--format` and `--json` for
+  scripts.
+- **Resume from anywhere.** `claudes -r api-refactor` changes
   into the session's directory and runs `claude --resume`.
   A session that is already open in another terminal is not
   opened twice; `--fork` branches off a copy instead.
@@ -90,16 +95,22 @@ claudes --here                # sessions in or below this directory
 claudes --unnamed -s msgs     # unnamed sessions, longest first
 claudes pick                  # fuzzy finder, Enter resumes
 claudes show api-refactor     # details, first and last prompt
-claudes r api-refactor        # resume it in its own directory
+claudes -r api-refactor       # resume it in its own directory
 claudes rename 71c4 "release 2.4"
 claudes grep "connection pool"
 claudes audit                 # secrets and risky actions
 claudes review api-refactor   # /security-review in that repo
+
+# clean up: unnamed sessions started in ~, idle for a month
+claudes --unnamed --dir ~ --older 30d       # look first
+claudes rm --unnamed --dir ~ --older 30d    # then move to Trash
+claudes --older 90d -q | claudes rm -       # or through a pipe
 ```
 
 A session is addressed by an id prefix (`71c4`) or by its title.
 When several sessions share a title, `show` and `resume` take
-the most recent one.
+the most recent one; when a reference still fits several, a
+picker opens with just those.
 
 ## Documentation
 

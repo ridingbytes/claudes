@@ -47,7 +47,7 @@ msgs` lists the sessions most worth naming.
 ## The first run is slow
 
 The first run parses every transcript, about one second per
-gigabyte for `list` and about a minute per gigabyte for
+gigabyte for `list` and about 20 seconds per gigabyte for
 `audit`. Later runs use the caches. If every run is slow, check
 that `~/.cache` is writable.
 

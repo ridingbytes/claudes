@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claudes"
-version = "0.1.2"
+version = "0.2.0"
 description = "List, find, resume and audit your Claude Code sessions"
 readme = "README.md"
 license = "MIT"
