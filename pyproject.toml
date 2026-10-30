@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claudes"
+version = "0.1.0"
+description = "List, find, resume and audit your Claude Code sessions"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "RIDING BYTES GmbH" }]
+requires-python = ">=3.9"
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "flake8"]
+
+[project.scripts]
+claudes = "claudes:run"
+
+[project.urls]
+Homepage = "https://github.com/ridingbytes/claudes"
+
+[tool.setuptools]
+py-modules = ["claudes"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
