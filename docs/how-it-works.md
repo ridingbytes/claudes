@@ -12,11 +12,13 @@ Claude Code stores one JSON Lines file per session:
 ~/.claude/projects/<project-slug>/<session-id>/     sidecar: subagents, tool results
 ```
 
-The project slug is the working directory with every `/` and
-`.` replaced by `-`, so `/Users/me/develop/api` becomes
-`-Users-me-develop-api`. The slug cannot be decoded reliably,
-which is why `claudes` takes the directory from the `cwd` field
-of the first record that has one.
+The project slug is the working directory with every character
+other than a letter or digit replaced by `-`, so
+`/Users/me/develop/api` becomes `-Users-me-develop-api`. The slug
+cannot be decoded on its own, which is why `claudes` takes the
+directory from the `cwd` field of the first record that has one.
+Where no record has one, the slug is matched against the file
+system one directory level at a time.
 
 Each line is one record. The ones `claudes` uses:
 
@@ -82,12 +84,23 @@ history snapshots and tool results never reach the JSON parser
 when listing. This keeps the first scan of a gigabyte of
 transcripts around one second.
 
+## Memories
+
+Auto memories are read straight from
+`~/.claude/projects/<project>/memory/`, without a cache: they
+are small. See [memory.md](memory.md).
+
 ## Writing
 
-`claudes` writes to Claude Code's files in exactly two cases:
+`claudes` writes to Claude Code's files only on these commands:
 
 - `rename` appends one `custom-title` record to a transcript.
 - `rm` moves a transcript and its sidecar to the Trash.
+- `memory rm` moves a memory file to the Trash and removes its
+  line from the project's `MEMORY.md`.
+- `memory promote` appends to `~/.claude/CLAUDE.md`, and with
+  `--move` also does what `memory rm` does.
 
-Both refuse to touch a running session, since Claude Code keeps
-the transcript open and appends to it.
+`rename` and `rm` refuse to touch a running session, since Claude
+Code keeps the transcript open and appends to it. Every command
+that writes asks first, unless `-y` is given.
