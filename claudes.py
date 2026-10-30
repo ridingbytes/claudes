@@ -16,6 +16,8 @@ Usage:
   claudes grep TEXT [FILTERS]           full text search
   claudes audit [QUERY...] [FILTERS]    secrets and risky actions
   claudes review ID|DIR [FOCUS...]      start /security-review there
+  claudes memory [ACTION]               list, show, grep, dupes,
+                                        promote, rm, edit memories
 
 ID is a session id prefix or (part of) a session title. When it
 matches several sessions, a picker opens to choose one. "-" reads
@@ -29,6 +31,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -39,7 +42,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.path.join(HOME, ".claude")
@@ -48,6 +51,9 @@ REGISTRY = os.path.join(CLAUDE, "sessions")
 TRASH = os.path.join(HOME, ".Trash", "claude-sessions")
 CACHE = os.path.join(HOME, ".cache", "claude-sessions.json")
 AUDIT_CACHE = os.path.join(HOME, ".cache", "claude-sessions-audit.json")
+GLOBAL_CLAUDE_MD = os.path.join(CLAUDE, "CLAUDE.md")
+# Sits next to the project memories but is not loaded by Claude Code
+USER_MEMORY = os.path.join(CLAUDE, "memory")
 
 # Bump when the cached Meta or audit findings change shape or meaning
 CACHE_VERSION = 4
@@ -338,6 +344,13 @@ def clip(text, width):
     if len(text) <= width:
         return text.ljust(width)
     return text[: width - 1] + "\u2026"
+
+
+def clip_left(text, width):
+    """Fit text into width, cutting at the start: ends matter in paths."""
+    if len(text) <= width:
+        return text.ljust(width)
+    return "\u2026" + text[len(text) - width + 1:]
 
 
 def short_path(path):
@@ -663,9 +676,54 @@ def pick_title(meta):
     return "", None
 
 
+RE_NOT_SLUG = re.compile(r"[^A-Za-z0-9]")
+
+
+def slugify(name):
+    """Encode a path the way Claude Code names project folders."""
+    return RE_NOT_SLUG.sub("-", name)
+
+
+def list_directories(base):
+    """Return the names of the directories in base, or []."""
+    try:
+        return sorted(e.name for e in os.scandir(base) if e.is_dir())
+    except OSError:
+        return []
+
+
+def walk_slug(base, rest):
+    """Return (deepest existing path, part of the slug left over).
+
+    Walks the file system one level at a time and follows entries
+    whose own slug starts the remaining slug, so dots, dashes and
+    umlauts that all became "-" are recovered from the real names.
+    """
+    if not rest:
+        return base, ""
+    best = (base, rest)
+    for entry in list_directories(base):
+        encoded = slugify(entry)
+        if rest != encoded and not rest.startswith(encoded + "-"):
+            continue
+        path, left = walk_slug(os.path.join(base, entry),
+                               rest[len(encoded) + 1:])
+        if not left:
+            return path, ""
+        if len(left) < len(best[1]):
+            best = (path, left)
+    return best
+
+
+@functools.cache
 def decode_slug(slug):
-    """Guess a directory from a project folder name (lossy)."""
-    return slug.replace("-", "/")
+    """Return the directory a project folder name stands for.
+
+    When the directory is gone, the existing part is resolved and
+    the rest of the folder name is appended as it is.
+    """
+    path, left = walk_slug(os.sep, slug.lstrip("-"))
+    return os.path.join(path, left) if left else path
 
 
 def build_session(path, meta, process=None):
@@ -1752,6 +1810,353 @@ def cmd_audit(args, sessions):
     print_audit_summary(shown, len(selected))
 
 
+# Memory
+#
+# Claude Code keeps auto memories per project as Markdown files with a
+# small frontmatter, listed in an index file MEMORY.md that is loaded
+# into every session of that project. Instructions that apply
+# everywhere belong in ~/.claude/CLAUDE.md, which every session loads.
+
+@dataclass
+class Memory:
+    """One memory file of a project, or of ~/.claude/memory."""
+
+    path: str
+    project: str
+    name: str = ""
+    description: str = ""
+    type: str = ""
+    body: str = ""
+    indexed: bool = True
+    loaded: bool = True
+
+    @property
+    def stem(self):
+        return os.path.basename(self.path)[: -len(".md")]
+
+    @property
+    def label(self):
+        """Project and file name, unique across all memories."""
+        return f"{short_path(self.project)}/{self.stem}"
+
+
+MEMORY_INDEX = "MEMORY.md"
+FRONTMATTER = "---\n"
+
+
+def split_frontmatter(text):
+    """Return (frontmatter lines, body) of a Markdown file."""
+    if not text.startswith(FRONTMATTER):
+        return [], text
+    head, separator, body = text[len(FRONTMATTER):].partition("\n---")
+    if not separator:
+        return [], text
+    return head.splitlines(), body.lstrip("-").lstrip("\n")
+
+
+def frontmatter_fields(lines):
+    """Return the key: value pairs of frontmatter lines.
+
+    Nested keys (metadata: / type: ...) are flattened, which is all
+    the memory format needs.
+    """
+    fields = {}
+    for line in lines:
+        key, colon, value = line.strip().partition(":")
+        if colon and value.strip():
+            fields[key.strip()] = value.strip().strip("\"'")
+    return fields
+
+
+def index_links(directory):
+    """Return the file names linked from a memory index."""
+    text = read_text(os.path.join(directory, MEMORY_INDEX))
+    return set(re.findall(r"\]\(([^)]+\.md)\)", text))
+
+
+def read_text(path):
+    """Return the text of a file, or "" if it cannot be read."""
+    try:
+        with open(path, errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def read_memory(path, project, linked, loaded=True):
+    """Parse one memory file."""
+    lines, body = split_frontmatter(read_text(path))
+    fields = frontmatter_fields(lines)
+    stem = os.path.basename(path)[: -len(".md")]
+    return Memory(path=path, project=project,
+                  name=fields.get("name", stem),
+                  description=fields.get("description", ""),
+                  type=fields.get("type", ""), body=body.strip(),
+                  indexed=os.path.basename(path) in linked,
+                  loaded=loaded)
+
+
+def memory_directories(sessions):
+    """Yield (memory directory, project directory, loaded) triples.
+
+    The project directory comes from the sessions of that project
+    folder; the folder name itself cannot be decoded reliably.
+    """
+    projects = {os.path.basename(os.path.dirname(s.path)): s.cwd
+                for s in sessions}
+    for directory in sorted(glob_memory_dirs()):
+        slug = os.path.basename(os.path.dirname(directory))
+        yield directory, projects.get(slug) or decode_slug(slug), True
+    if os.path.isdir(USER_MEMORY):
+        yield USER_MEMORY, USER_MEMORY, False
+
+
+def glob_memory_dirs():
+    """Return the memory directories of all project folders."""
+    if not os.path.isdir(PROJECTS):
+        return []
+    found = (os.path.join(PROJECTS, slug, "memory")
+             for slug in os.listdir(PROJECTS))
+    return [path for path in found if os.path.isdir(path)]
+
+
+def load_memories(sessions):
+    """Return every memory, grouped by project."""
+    memories = []
+    for directory, project, loaded in memory_directories(sessions):
+        linked = index_links(directory)
+        for name in sorted(os.listdir(directory)):
+            if name.endswith(".md") and name != MEMORY_INDEX:
+                path = os.path.join(directory, name)
+                memories.append(read_memory(path, project, linked, loaded))
+    return memories
+
+
+def memory_matches(memory, terms):
+    """Return True when every term occurs in the memory."""
+    text = " ".join([memory.label, memory.name, memory.description,
+                     memory.type, memory.body]).lower()
+    return all(term.lower() in text for term in terms)
+
+
+def select_memories(memories, args):
+    """Return the memories passing --type, --under/--here and query."""
+    under = os.getcwd() if args.here else full_path(args.under)
+    return [m for m in memories
+            if (not args.type or m.type == args.type)
+            and (under is None or m.project == under
+                 or m.project.startswith(under + os.sep))
+            and memory_matches(m, args.query)]
+
+
+def find_memories(memories, ref):
+    """Return the memories a reference could mean.
+
+    A reference is a file name without .md, a name from the
+    frontmatter, or project/file as printed in the list.
+    """
+    ref = ref.lower().removesuffix(".md")
+    exact = [m for m in memories
+             if ref in (m.stem.lower(), m.name.lower())]
+    if exact:
+        return exact
+    return [m for m in memories if ref in m.label.lower()]
+
+
+def resolve_memory(memories, ref):
+    """Return the one memory ref means, or exit naming candidates."""
+    found = find_memories(memories, ref)
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        fail(f"no memory matches {ref!r}")
+    print(f"claudes: {ref!r} matches {len(found)} memories:",
+          file=sys.stderr)
+    for memory in found[:20]:
+        print("  " + memory.label, file=sys.stderr)
+    print("Use project/name as printed above.", file=sys.stderr)
+    sys.exit(1)
+
+
+def memory_flags(memory):
+    """Return markers for memories that are unused or orphaned."""
+    if not memory.loaded:
+        return paint("not loaded", "31")
+    if not os.path.isdir(memory.project):
+        return paint("project gone", "31")
+    if not memory.indexed:
+        return paint("not in index", "33")
+    return ""
+
+
+def format_memory(memory, width):
+    """Return one list line for a memory."""
+    return GAP.join([
+        paint(clip(memory.type or "-", 9), "35"),
+        paint(clip_left(memory.label, 44), "36"),
+        clip(memory.description or memory.name, width),
+        memory_flags(memory),
+    ]).rstrip()
+
+
+def cmd_memory_list(args, memories):
+    """Print one line per memory."""
+    selected = select_memories(memories, args)
+    width = max(table_layout().title + table_layout().directory - 44, 30)
+    for memory in selected:
+        print(format_memory(memory, width))
+    if sys.stdout.isatty():
+        projects = len({m.project for m in selected})
+        print(dim(f"{len(selected)} memories in {projects} projects"))
+
+
+def cmd_memory_show(args, memories):
+    """Print a memory with its metadata."""
+    memory = resolve_memory(memories, args.ref)
+    rows = [("name", memory.name), ("type", memory.type),
+            ("project", short_path(memory.project)),
+            ("file", short_path(memory.path)),
+            ("note", memory_flags(memory))]
+    for label, value in rows:
+        if value:
+            print(f"{dim(label.ljust(10))} {value}")
+    print("\n" + (memory.description and memory.description + "\n\n")
+          + memory.body)
+
+
+def cmd_memory_grep(args, memories):
+    """Print matching lines of the memories containing every term."""
+    terms = [t.lower() for t in args.text]
+    for memory in memories:
+        if not memory_matches(memory, terms):
+            continue
+        print(paint(memory.label, "36"))
+        for line in memory.body.splitlines():
+            if any(t in line.lower() for t in terms):
+                print("    " + highlight(line.strip(), terms[0]))
+
+
+def duplicate_groups(memories):
+    """Return lists of memories sharing a name across projects."""
+    groups = {}
+    for memory in memories:
+        groups.setdefault(memory.name.lower(), []).append(memory)
+    return [group for group in groups.values()
+            if len({m.project for m in group}) > 1]
+
+
+def cmd_memory_dupes(args, memories):
+    """List memories kept in several projects: global candidates."""
+    groups = duplicate_groups(memories)
+    for group in groups:
+        print(paint(group[0].name, "1"))
+        for memory in group:
+            print("    " + paint(memory.label, "36") + "  "
+                  + dim(clip(memory.description, 60).rstrip()))
+    if not groups:
+        print("no memory appears in more than one project")
+
+
+def claude_md_section(memory):
+    """Return the Markdown section promote appends to CLAUDE.md."""
+    title = memory.name or memory.stem
+    lines = [f"## {title}", ""]
+    if memory.description:
+        lines += [memory.description, ""]
+    lines.append(memory.body)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def section_exists(text, memory):
+    """Return True when CLAUDE.md has a heading with the memory name."""
+    pattern = r"^#+\s+" + re.escape(memory.name or memory.stem) + r"\s*$"
+    return re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+
+
+def blank_line_before(text):
+    """Return what to append so that exactly one blank line follows."""
+    if not text or text.endswith("\n\n"):
+        return ""
+    return "\n" if text.endswith("\n") else "\n\n"
+
+
+def append_to_claude_md(sections):
+    """Back up CLAUDE.md, then append the sections to it."""
+    current = read_text(GLOBAL_CLAUDE_MD)
+    if current:
+        shutil.copy2(GLOBAL_CLAUDE_MD, GLOBAL_CLAUDE_MD + ".claudes-bak")
+    with open(GLOBAL_CLAUDE_MD, "a") as handle:
+        handle.write(blank_line_before(current) + "\n".join(sections))
+
+
+def remove_index_line(memory):
+    """Drop the line that links a memory from its MEMORY.md."""
+    index = os.path.join(os.path.dirname(memory.path), MEMORY_INDEX)
+    text = read_text(index)
+    link = f"({os.path.basename(memory.path)})"
+    kept = [line for line in text.splitlines(keepends=True)
+            if link not in line]
+    if len(kept) != len(text.splitlines(keepends=True)):
+        with open(index, "w") as handle:
+            handle.writelines(kept)
+
+
+def trash_memory(memory):
+    """Move a memory file to the Trash and unlink it from the index."""
+    slug = os.path.basename(os.path.dirname(os.path.dirname(memory.path)))
+    target = os.path.join(TRASH, "memory", slug or "user")
+    os.makedirs(target, exist_ok=True)
+    shutil.move(memory.path, os.path.join(target,
+                                          os.path.basename(memory.path)))
+    remove_index_line(memory)
+
+
+def cmd_memory_promote(args, memories):
+    """Append memories to ~/.claude/CLAUDE.md, optionally moving them."""
+    chosen = [resolve_memory(memories, ref) for ref in args.refs]
+    current = read_text(GLOBAL_CLAUDE_MD)
+    for memory in chosen:
+        if section_exists(current, memory):
+            fail(f"{short_path(GLOBAL_CLAUDE_MD)} already has a section "
+                 f"{memory.name!r}")
+    sections = [claude_md_section(m) for m in chosen]
+    print(dim(f"appending to {short_path(GLOBAL_CLAUDE_MD)}:") + "\n")
+    print("\n".join(sections))
+    action = "Append" + (" and move the memories to the Trash"
+                         if args.move else "")
+    if not args.yes and not confirm(action + "?"):
+        return
+    append_to_claude_md(sections)
+    for memory in chosen if args.move else []:
+        trash_memory(memory)
+    print(f"appended {len(chosen)} section(s); backup in "
+          f"{short_path(GLOBAL_CLAUDE_MD)}.claudes-bak")
+
+
+def cmd_memory_rm(args, memories):
+    """Move memories to the Trash and drop them from their index."""
+    chosen = [resolve_memory(memories, ref) for ref in args.refs]
+    for memory in chosen:
+        print(paint(memory.label, "36") + "  " + dim(memory.description))
+    if not args.yes and not confirm(f"Move {len(chosen)} to the Trash?"):
+        return
+    for memory in chosen:
+        trash_memory(memory)
+    print(f"moved {len(chosen)} memory file(s) to {short_path(TRASH)}")
+
+
+def cmd_memory_edit(args, memories):
+    """Open a memory in $EDITOR."""
+    memory = resolve_memory(memories, args.ref)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    os.execvp("sh", ["sh", "-c", f'{editor} "$0"', memory.path])
+
+
+def cmd_memory(args, sessions):
+    """Dispatch a memory subcommand."""
+    args.memory_func(args, load_memories(sessions))
+
+
 # Command line
 
 def filter_options():
@@ -1879,6 +2284,56 @@ def add_security_commands(sub, filters):
     review.set_defaults(func=cmd_review)
 
 
+def add_memory_commands(sub):
+    """Add memory with its own subcommands; list is the default."""
+    memory = sub.add_parser("memory", aliases=["mem"],
+                            help="list, read and promote auto memories")
+    memory.set_defaults(func=cmd_memory)
+    actions = memory.add_subparsers(dest="memory_command",
+                                    metavar="ACTION")
+
+    listing = actions.add_parser("list", aliases=["ls"],
+                                 help="list memories (default)")
+    listing.add_argument("query", nargs="*")
+    listing.add_argument("--type", help="feedback, project, reference,"
+                                        " user")
+    listing.add_argument("--under", metavar="PATH",
+                         help="only projects in or below PATH")
+    listing.add_argument("--here", action="store_true",
+                         help="only this directory and below")
+    listing.set_defaults(memory_func=cmd_memory_list)
+
+    show = actions.add_parser("show", help="print one memory")
+    show.add_argument("ref", metavar="MEMORY")
+    show.set_defaults(memory_func=cmd_memory_show)
+
+    grep = actions.add_parser("grep", help="search all memories")
+    grep.add_argument("text", nargs="+")
+    grep.set_defaults(memory_func=cmd_memory_grep)
+
+    dupes = actions.add_parser("dupes", help="memories kept in several"
+                                             " projects")
+    dupes.set_defaults(memory_func=cmd_memory_dupes)
+
+    promote = actions.add_parser(
+        "promote", help="append memories to ~/.claude/CLAUDE.md")
+    promote.add_argument("refs", metavar="MEMORY", nargs="+")
+    promote.add_argument("--move", action="store_true",
+                         help="then move the memory files to the Trash")
+    promote.add_argument("-y", "--yes", action="store_true")
+    promote.set_defaults(memory_func=cmd_memory_promote)
+
+    remove = actions.add_parser("rm", help="move memories to the Trash")
+    remove.add_argument("refs", metavar="MEMORY", nargs="+")
+    remove.add_argument("-y", "--yes", action="store_true")
+    remove.set_defaults(memory_func=cmd_memory_rm)
+
+    edit = actions.add_parser("edit", help="open a memory in $EDITOR")
+    edit.add_argument("ref", metavar="MEMORY")
+    edit.set_defaults(memory_func=cmd_memory_edit)
+    return set(actions.choices)
+
+
 EXAMPLES = """\
 examples:
   claudes                      sessions, most recently active first
@@ -1893,6 +2348,11 @@ selecting many sessions:
   claudes rm --unnamed --dir ~ --older 30d    move them to the Trash
   claudes --older 60d -q | claudes rm -       the same through a pipe
   claudes --app -q | claudes audit --from -   audit only those
+
+memories:
+  claudes memory                         every memory of every project
+  claudes memory dupes                   kept in several projects
+  claudes memory promote no_dashes       append to ~/.claude/CLAUDE.md
 """
 
 
@@ -1909,27 +2369,37 @@ def build_parser():
     add_browse_commands(sub, filters)
     add_manage_commands(sub, filters)
     add_security_commands(sub, filters)
-    return parser, set(sub.choices) | {"-h", "--help", "--version"}
+    memory_actions = add_memory_commands(sub)
+    commands = set(sub.choices) | {"-h", "--help", "--version"}
+    return parser, commands, memory_actions
 
 
 # "claudes -r ID" resumes, the habit from "claude -r ID"
 RESUME_FLAGS = {"-r", "--resume"}
 
 
-def normalize_argv(argv, commands):
-    """Map -r to resume and make list the default command."""
+MEMORY_COMMANDS = {"memory", "mem"}
+HELP_FLAGS = {"-h", "--help"}
+
+
+def normalize_argv(argv, commands, memory_actions):
+    """Map -r to resume and make list the default, also for memory."""
     if argv and argv[0] in RESUME_FLAGS:
         return ["resume"] + argv[1:]
     if not argv or argv[0] not in commands:
         return ["list"] + argv
+    if argv[0] in MEMORY_COMMANDS:
+        rest = argv[1:]
+        if not rest or rest[0] not in memory_actions | HELP_FLAGS:
+            return [argv[0], "list"] + rest
     return argv
 
 
 def main(argv=None):
     """Parse the command line and run the command."""
-    parser, commands = build_parser()
+    parser, commands, memory_actions = build_parser()
     argv = sys.argv[1:] if argv is None else argv
-    args = parser.parse_args(normalize_argv(argv, commands))
+    args = parser.parse_args(normalize_argv(argv, commands, memory_actions))
     args.func(args, load_sessions())
 
 
@@ -1937,6 +2407,8 @@ def run():
     """Console entry point: quiet on ctrl-c and on a closed pipe."""
     try:
         main()
+        # Flush here, where a closed pipe can still be caught
+        sys.stdout.flush()
     except KeyboardInterrupt:
         sys.exit(130)
     except BrokenPipeError:

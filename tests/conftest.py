@@ -21,6 +21,10 @@ def claude_home(tmp_path, monkeypatch):
     monkeypatch.setattr(claudes, "AUDIT_CACHE",
                         str(tmp_path / "audit.json"))
     monkeypatch.setattr(claudes, "TRASH", str(tmp_path / "trash"))
+    monkeypatch.setattr(claudes, "USER_MEMORY", str(tmp_path / "memory"))
+    monkeypatch.setattr(claudes, "GLOBAL_CLAUDE_MD",
+                        str(tmp_path / "CLAUDE.md"))
+    claudes.decode_slug.cache_clear()
     return tmp_path
 
 

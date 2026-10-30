@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- `claudes memory`: list the auto memories of every project with
+  type and description, marking files missing from the project
+  index, memories of directories that no longer exist, and the
+  unused `~/.claude/memory` folder.
+- `memory show`, `memory grep`, `memory edit`.
+- `memory dupes`: memories kept in several projects.
+- `memory promote`: append memories to `~/.claude/CLAUDE.md` as
+  sections, with preview, confirmation and a backup. `--move`
+  then removes the memory files and their index lines.
+- `memory rm`: move memories to the Trash and unlink them.
+- Project directories of sessions whose directory no longer has
+  a transcript are recovered from the file system: `.`, `-` and
+  umlauts that Claude Code encoded as `-` are matched against
+  real names. Before, `~/.hermes` showed as `~//hermes`.
+- A closed pipe (`claudes | head`) no longer prints a traceback
+  at exit.
+
 ## 0.2.0
 
 Review and refactoring of the whole tool, plus selecting many

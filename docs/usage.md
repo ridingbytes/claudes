@@ -10,6 +10,7 @@ claudes rm [ID...|-] [FILTERS]        move sessions to the Trash
 claudes grep TEXT [FILTERS]           full text search
 claudes audit [QUERY...] [FILTERS]    secrets and risky actions
 claudes review ID|DIR [FOCUS...]      start /security-review there
+claudes memory [ACTION]               auto memories, see memory.md
 ```
 
 `list` is the default command: `claudes api` is the same as
@@ -254,6 +255,10 @@ every call, so it takes a few seconds on large histories.
 ## audit and review
 
 See [audit.md](audit.md).
+
+## memory
+
+See [memory.md](memory.md).
 
 ## Environment
 
