@@ -13,7 +13,11 @@ It writes:
 - `~/.cache/claude-sessions.json` (mode `0600`)
 - `~/.cache/claude-sessions-audit.json` (mode `0600`)
 - a `custom-title` record into a transcript on `rename`
-- `~/.Trash/claude-sessions/` on `rm`
+- `~/.Trash/claude-sessions/` on `rm` and `memory rm`
+- `~/.claude/CLAUDE.md` on `memory promote`, after asking, with
+  the previous version kept as `CLAUDE.md.claudes-bak`
+- a project's `memory/MEMORY.md` on `memory rm` and
+  `memory promote --move` (the line of the removed memory)
 
 `resume` and `review` hand over to the `claude` binary with
 `exec`; from then on Claude Code's own behavior and settings

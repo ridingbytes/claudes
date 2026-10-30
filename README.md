@@ -58,6 +58,10 @@ a09d33b7        3d             term      Fix flaky upload test     ~/develop/api
 - **Manage.** Rename sessions (`claudes rename`), move them to
   the Trash (`claudes rm`), search the full text of every
   conversation (`claudes grep`).
+- **Memory.** `claudes memory` lists the auto memories of every
+  project, `memory dupes` finds rules kept in several projects,
+  and `memory promote` moves one into `~/.claude/CLAUDE.md`, where
+  every session sees it.
 - **Audit.** `claudes audit` scans transcripts for secrets and
   risky actions and prints masked findings by severity.
   `claudes review` starts a Claude Code `/security-review` in a
@@ -105,6 +109,10 @@ claudes review api-refactor   # /security-review in that repo
 claudes --unnamed --dir ~ --older 30d       # look first
 claudes rm --unnamed --dir ~ --older 30d    # then move to Trash
 claudes --older 90d -q | claudes rm -       # or through a pipe
+
+# memories: which rules live in several projects, make one global
+claudes memory dupes
+claudes memory promote api/feedback_no_dashes --move
 ```
 
 A session is addressed by an id prefix (`71c4`) or by its title.
@@ -118,6 +126,7 @@ picker opens with just those.
 |---|---|
 | [docs/installation.md](docs/installation.md)       | pipx, single file, checkout, completion |
 | [docs/usage.md](docs/usage.md)                     | Every command and option with examples |
+| [docs/memory.md](docs/memory.md)                   | Auto memories: list, dupes, promote to CLAUDE.md |
 | [docs/audit.md](docs/audit.md)                     | What `audit` detects, severities, `review` |
 | [docs/how-it-works.md](docs/how-it-works.md)       | Transcript format, live registry, caches |
 | [docs/security.md](docs/security.md)               | What is read and written, masking, privacy |
