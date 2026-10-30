@@ -100,6 +100,8 @@ are small. See [memory.md](memory.md).
   line from the project's `MEMORY.md`.
 - `memory promote` appends to `~/.claude/CLAUDE.md`, and with
   `--move` also does what `memory rm` does.
+- `memory mv` moves memory files and their index lines to the
+  memory folder of another project.
 
 `rename` and `rm` refuse to touch a running session, since Claude
 Code keeps the transcript open and appends to it. Every command

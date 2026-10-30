@@ -60,8 +60,9 @@ a09d33b7        3d             term      Fix flaky upload test     ~/develop/api
   conversation (`claudes grep`).
 - **Memory.** `claudes memory` lists the auto memories of every
   project, `memory dupes` finds rules kept in several projects,
-  and `memory promote` moves one into `~/.claude/CLAUDE.md`, where
-  every session sees it.
+  `memory promote` moves one into `~/.claude/CLAUDE.md`, where
+  every session sees it, and `memory mv` takes memories along
+  when a project directory was renamed.
 - **Audit.** `claudes audit` scans transcripts for secrets and
   risky actions and prints masked findings by severity.
   `claudes review` starts a Claude Code `/security-review` in a
@@ -113,6 +114,8 @@ claudes --older 90d -q | claudes rm -       # or through a pipe
 # memories: which rules live in several projects, make one global
 claudes memory dupes
 claudes memory promote api/feedback_no_dashes --move
+claudes memory --gone                       # orphaned by a rename
+claudes memory mv --dir ~/develop/old --to ~/develop/new
 ```
 
 A session is addressed by an id prefix (`71c4`) or by its title.

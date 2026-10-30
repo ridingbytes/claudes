@@ -11,11 +11,12 @@ places, and promotes a memory to `~/.claude/CLAUDE.md`, which
 every session loads.
 
 ```
-claudes memory [QUERY...] [--type T] [--under PATH|--here]
+claudes memory [QUERY...] [--type T] [--under PATH|--here] [--gone]
 claudes memory show MEMORY
 claudes memory grep TEXT
 claudes memory dupes
 claudes memory promote MEMORY... [--move] [-y]
+claudes memory mv MEMORY...|--dir OLD --to DIR [-y]
 claudes memory rm MEMORY... [-y]
 claudes memory edit MEMORY
 ```
@@ -53,6 +54,7 @@ claudes memory deploy                   # all words must match
 claudes memory --type feedback          # only one type
 claudes memory --under ~/develop/api    # only projects below a path
 claudes mem --here
+claudes memory --gone                   # orphaned memories only
 ```
 
 Columns: type, project and file, description. Markers at the
@@ -125,6 +127,35 @@ claudes memory rm web/feedback_no_dashes
 Edit `CLAUDE.md` afterwards if the section should read like the
 rest of the file: a memory is written as a note about a
 situation, `CLAUDE.md` as standing instructions.
+
+## mv
+
+```sh
+claudes memory mv --dir ~/develop/api --to ~/work/api
+claudes memory mv api/project_plan --to ~/work/api-v2
+```
+
+Claude Code finds a project's memories by the path of its
+directory. After a directory was moved or renamed, its memories
+are no longer loaded, and the list marks them `project gone`.
+`mv` moves them to the memory folder of the new path.
+
+With `--dir OLD`, every memory of OLD and of the projects below it
+moves, and the part below OLD is kept: memories of `OLD/app` go to
+`DIR/app`. Without it, the named memories go to DIR itself. DIR
+must exist.
+
+The line that links a memory from its old `MEMORY.md` moves to the
+new one. A memory that was not in the index stays out of it. When
+the target already has a file of the same name and text, the moved
+copy goes to the Trash; when the text differs, nothing is moved
+until one of the two is merged or removed. `mv` prints the plan
+and asks first.
+
+A directory that no longer exists cannot always be told from its
+folder name: `old-app` and `old/app` encode the same. A subproject
+counts as below OLD only when one of its sessions recorded the
+directory. Move the others by name.
 
 ## rm
 
