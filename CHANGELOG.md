@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.2.0
+
+Review and refactoring of the whole tool, plus selecting many
+sessions at once.
+
+Selecting and pipes:
+
+- Filters `--older AGE` and `--newer AGE` (`30m`, `12h`, `30d`,
+  `2w`) for idle sessions, `--dir PATH` for sessions started
+  exactly in a directory, `--under PATH` for a directory and
+  everything below it.
+- `-q` prints ids, `--format` fills a template, `--json` prints
+  all fields.
+- `-` as an id reads ids from stdin (`rm`, `show`), `--from FILE`
+  restricts any filtered command to listed ids. Lines may be
+  whole table rows.
+- `rm` takes filters: `claudes rm --unnamed --dir ~ --older 30d`.
+  It asks on the terminal even behind a pipe, and skips running
+  sessions a filter matches.
+- `rm --empty` moves every session without a prompt.
+- `show` takes several sessions.
+
+Easier to use:
+
+- A reference that fits several sessions opens the fzf picker
+  with just those, instead of stopping with a list.
+- `claudes -r` without an id opens the picker, as `claude -r`
+  does.
+- `pick` has a table header, keeps colors, hands the query to
+  fzf as an editable search, and ctrl-y copies the id. The key
+  was advertised before but did nothing.
+- Title and directory columns use the terminal width.
+- `list` ends with a footer that counts hidden sessions.
+- `grep` takes the list filters, highlights the match and has
+  `--max`.
+- `show` names where the title came from and prints the resume
+  command.
+- `claudes -h` shows examples; every option has help text.
+
+Faster and more accurate:
+
+- `audit` scans uncached transcripts in parallel: about three
+  times faster on the first run.
+- A private key counts only with a key body after the header.
+  Text that merely mentions the header was reported before.
+
+Internals:
+
+- Sessions, metadata, findings and filters are dataclasses
+  instead of loose dicts.
+- One cache class serves both caches. The key is taken before a
+  transcript is read, so a transcript that grows meanwhile is
+  read again next time. Unchanged caches are not rewritten.
+- The list of subcommands comes from the parser instead of a
+  second hand-kept set.
+- Ctrl-c exits with 130, a closed pipe quietly.
+- Requires Python 3.10 (dataclass fields use `X | None`).
+
 ## 0.1.2
 
 - `claudes -r ID` and `claudes --resume ID` resume a session,

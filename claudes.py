@@ -1,104 +1,343 @@
 #!/usr/bin/env python3
-"""List, find, resume and manage Claude Code sessions.
+"""List, find, resume and audit Claude Code sessions.
 
-Reads the transcripts under ~/.claude/projects and the live session
-registry under ~/.claude/sessions. Metadata is cached per transcript
-(keyed by mtime and size) in ~/.cache/claude-sessions.json, so only
-changed transcripts are parsed again.
+Reads the transcripts under ~/.claude/projects and the registry of
+running sessions under ~/.claude/sessions. Parsed metadata is cached
+per transcript, keyed by mtime and size, so only changed transcripts
+are read again.
 
 Usage:
   claudes [list] [QUERY...] [FILTERS]   list sessions
   claudes pick [QUERY...] [FILTERS]     fzf picker, Enter resumes
-  claudes show ID                       details of one session
-  claudes resume ID [--fork]            resume in its directory
-  claudes -r ID                         same, as with claude -r
+  claudes -r [ID] [--fork]              resume, as with claude -r
+  claudes show ID...|-                  details of sessions
   claudes rename ID NAME                set the session title
-  claudes rm ID...                      move sessions to Trash
-  claudes grep TEXT                     full text search
+  claudes rm [ID...|-] [FILTERS]        move sessions to the Trash
+  claudes grep TEXT [FILTERS]           full text search
   claudes audit [QUERY...] [FILTERS]    secrets and risky actions
   claudes review ID|DIR [FOCUS...]      start /security-review there
 
-Filters:
-  -a, --all              include empty and continued sessions
-  --here                 only sessions in or below the current directory
-  --named, --unnamed     sessions with or without a title you gave
-  --app, --term          started in the Claude app or in a terminal
-  -s, --sort KEY         active (default), started, name, dir, msgs,
-                         size, cost
-  -R, --reverse          reverse the sort order
-  -n, --limit N          show at most N sessions
+ID is a session id prefix or (part of) a session title. When it
+matches several sessions, a picker opens to choose one. "-" reads
+ids from stdin, so selections pipe from one command to the next:
 
-ID is a session id prefix or (part of) a session title.
+  claudes --unnamed --older 30d -q | claudes rm -
 """
 
 import argparse
+import concurrent.futures
+import contextlib
+import dataclasses
 import datetime
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.path.join(HOME, ".claude")
 PROJECTS = os.path.join(CLAUDE, "projects")
 REGISTRY = os.path.join(CLAUDE, "sessions")
-CACHE = os.path.join(HOME, ".cache", "claude-sessions.json")
 TRASH = os.path.join(HOME, ".Trash", "claude-sessions")
-CACHE_VERSION = 3
+CACHE = os.path.join(HOME, ".cache", "claude-sessions.json")
+AUDIT_CACHE = os.path.join(HOME, ".cache", "claude-sessions-audit.json")
 
-RE_TIMESTAMP = re.compile(r'"timestamp":"([^"]+)"')
-RE_ENTRYPOINT = re.compile(r'"entrypoint":"([^"]+)"')
-RE_KIND = re.compile(r'"sessionKind":"([^"]+)"')
-RE_CWD = re.compile(r'"cwd":"((?:[^"\\]|\\.)*)"')
-RE_BRANCH = re.compile(r'"gitBranch":"((?:[^"\\]|\\.)*)"')
-RE_COMMAND = re.compile(r"<command-name>([^<]+)</command-name>")
-RE_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f-]{27}$")
+# Bump when the cached Meta or audit findings change shape or meaning
+CACHE_VERSION = 4
+AUDIT_VERSION = 7
+
+# Below this many transcripts to scan, a process pool costs more than
+# it saves
+PARALLEL_THRESHOLD = 4
+
+
+# Data model
+
+@dataclass
+class Meta:
+    """What one transcript tells about its session; cached as JSON."""
+
+    cwd: str | None = None
+    branch: str | None = None
+    first: str | None = None
+    last: str | None = None
+    titles: dict = field(default_factory=dict)
+    first_prompt: str | None = None
+    last_prompt: str | None = None
+    prompts: int = 0
+    continued_in: str | None = None
+    cost: float | None = None
+    prs: list = field(default_factory=list)
+    entrypoints: list = field(default_factory=list)
+    kind: str | None = None
+
+
+@dataclass
+class Process:
+    """A running Claude Code process, from the session registry."""
+
+    pid: int
+    kind: str = "interactive"
+    status: str = "?"
+    entrypoint: str | None = None
+
+    @property
+    def is_background(self):
+        return self.kind == "bg"
+
+    @property
+    def label(self):
+        prefix = "bg" if self.is_background else "run"
+        return f"{prefix}:{self.status}"
+
+
+@dataclass
+class Session(Meta):
+    """A transcript with its metadata and, if running, its process."""
+
+    id: str = ""
+    path: str = ""
+    size: int = 0
+    title: str = ""
+    title_source: str | None = None
+    process: Process | None = None
+
+    @property
+    def short_id(self):
+        return self.id[:8]
+
+    @property
+    def is_running(self):
+        return self.process is not None
+
+    @property
+    def is_named(self):
+        """True when the title is one you gave, not a generated one."""
+        return self.title_source in NAMED_SOURCES
+
+    @property
+    def is_hidden(self):
+        """Empty and superseded sessions are hidden unless running."""
+        if self.is_running:
+            return False
+        return self.prompts == 0 or self.continued_in is not None
+
+    @property
+    def all_entrypoints(self):
+        """Entrypoints from the transcript plus the live process."""
+        found = list(self.entrypoints)
+        live = self.process.entrypoint if self.process else None
+        if live and live not in found:
+            found.append(live)
+        return found
+
+    @property
+    def origin(self):
+        """Where the session was started: app, term, or another name."""
+        found = self.all_entrypoints
+        return entrypoint_label(found[0]) if found else "?"
+
+    @property
+    def source(self):
+        """Origin followed by later environments, such as term>app."""
+        labels = [entrypoint_label(e) for e in self.all_entrypoints]
+        label = ">".join(labels) or "?"
+        return label + " bg" if self.kind == "bg" else label
+
+
+@dataclass
+class Finding:
+    """One audit hit; repeated hits in a session raise the count."""
+
+    group: str
+    category: str
+    severity: str
+    detail: str
+    fp: str
+    where: str = ""
+    time: str | None = None
+    count: int = 1
+
+    @property
+    def key(self):
+        return (self.group, self.category, self.fp)
+
+
+@dataclass
+class Filters:
+    """Which sessions a command works on, and in which order."""
+
+    query: list = field(default_factory=list)
+    include_hidden: bool = False
+    named: bool | None = None
+    origin: str | None = None
+    directory: str | None = None
+    under: str | None = None
+    older: float | None = None
+    newer: float | None = None
+    ids: list | None = None
+    sort: str = "active"
+    reverse: bool = False
+    limit: int = 0
+
+    @classmethod
+    def from_args(cls, args, **overrides):
+        """Build filters from parsed command line options."""
+        under = os.getcwd() if args.here else full_path(args.under)
+        values = {
+            "query": getattr(args, "query", []),
+            "include_hidden": args.all,
+            "named": args.named,
+            "origin": args.origin,
+            "directory": full_path(args.dir),
+            "under": under,
+            "older": args.older,
+            "newer": args.newer,
+            "ids": read_ids(args.ids_from) if args.ids_from else None,
+            "sort": args.sort,
+            "reverse": args.reverse,
+            "limit": args.limit,
+        }
+        values.update(overrides)
+        return cls(**values)
+
+    @property
+    def selects(self):
+        """True when any filter narrows the sessions down."""
+        narrowing = (self.query, self.named is not None, self.origin,
+                     self.directory, self.under, self.older, self.newer,
+                     self.ids is not None)
+        return any(narrowing)
+
 
 TITLE_TYPES = {
     "custom-title": ("customTitle", "user"),
     "agent-name": ("agentName", "agent"),
     "ai-title": ("aiTitle", "ai"),
 }
+TITLE_SOURCE_LABELS = {
+    "user": "your name",
+    "agent": "agent name",
+    "ai": "AI title",
+    "prompt": "first prompt",
+}
 NAMED_SOURCES = ("user", "agent")
 ENTRYPOINT_LABELS = {"claude-desktop": "app", "cli": "term"}
 
-# Sort key name -> (function on a session, descending by default)
+# Sort key name -> (key function, descending by default)
 SORT_KEYS = {
-    "active": (lambda s: s["last"] or "", True),
-    "started": (lambda s: s["first"] or "", True),
-    "name": (lambda s: s["title"].lower(), False),
-    "dir": (lambda s: (s["cwd"] or "").lower(), False),
-    "msgs": (lambda s: s["prompts"], True),
-    "size": (lambda s: s["size"], True),
-    "cost": (lambda s: s["cost"] or 0, True),
+    "active": (lambda s: s.last or "", True),
+    "started": (lambda s: s.first or "", True),
+    "name": (lambda s: s.title.lower(), False),
+    "dir": (lambda s: (s.cwd or "").lower(), False),
+    "msgs": (lambda s: s.prompts, True),
+    "size": (lambda s: s.size, True),
+    "cost": (lambda s: s.cost or 0, True),
 }
 
 
-# Output helpers
+def entrypoint_label(entrypoint):
+    """Return app or term for known entrypoints, else the raw name."""
+    return ENTRYPOINT_LABELS.get(entrypoint, entrypoint)
+
+
+def full_path(path):
+    """Return an absolute path with ~ expanded, or None."""
+    if not path:
+        return None
+    return os.path.abspath(os.path.expanduser(path))
+
+
+DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+RE_DURATION = re.compile(r"^(\d+)([mhdw])$")
+
+
+def parse_duration(text):
+    """Return seconds for a duration like 30m, 12h, 30d or 2w."""
+    match = RE_DURATION.match(text.strip().lower())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a duration like 30m, 12h, 30d or 2w")
+    return int(match.group(1)) * DURATION_UNITS[match.group(2)]
+
+
+# A session id or the start of one, as the first word of a line
+RE_ID_TOKEN = re.compile(r"^[0-9a-f][0-9a-f-]{3,35}$")
+
+
+def id_token(line):
+    """Return the session id at the start of a line, or None.
+
+    Accepts plain ids from -q as well as whole table rows, whose
+    first column is the short id.
+    """
+    words = line.split()
+    if not words or not RE_ID_TOKEN.match(words[0]):
+        return None
+    return words[0]
+
+
+def read_ids(source):
+    """Return the session ids in a file, or on stdin for "-"."""
+    if source == "-":
+        return [t for t in map(id_token, sys.stdin) if t]
+    with open(source) as handle:
+        return [t for t in map(id_token, handle) if t]
+
+
+# Terminal output
+
+class Output:
+    """Color setting: None follows the terminal, True/False force it."""
+
+    color = None
+
 
 def use_color():
-    """Return True when stdout is a terminal that wants color."""
+    """Return True when output should carry ANSI colors."""
+    if Output.color is not None:
+        return Output.color
+    if os.environ.get("CLICOLOR_FORCE"):
+        return True
     return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+@contextlib.contextmanager
+def forced_color():
+    """Render with colors regardless of where output goes (for fzf)."""
+    previous = Output.color
+    Output.color = True
+    try:
+        yield
+    finally:
+        Output.color = previous
 
 
 def paint(text, code):
     """Wrap text in an ANSI color code when color is enabled."""
     if not use_color():
         return text
-    return "\033[{}m{}\033[0m".format(code, text)
+    return f"\033[{code}m{text}\033[0m"
+
+
+def dim(text):
+    """Return text in the dim style."""
+    return paint(text, "2")
 
 
 def clip(text, width):
-    """Cut text to width characters, marking the cut with an ellipsis."""
+    """Fit text into width characters, marking a cut with an ellipsis."""
     text = " ".join((text or "").split())
     if len(text) <= width:
         return text.ljust(width)
-    return text[: width - 1] + "…"
+    return text[: width - 1] + "\u2026"
 
 
 def short_path(path):
@@ -108,13 +347,36 @@ def short_path(path):
     return path or "?"
 
 
+def is_interactive():
+    """Return True when a person sits at the terminal."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def fail(message):
     """Print an error message and exit with status 1."""
     print("claudes: " + message, file=sys.stderr)
     sys.exit(1)
 
 
-# Time helpers
+class Progress:
+    """A one line counter on stderr, shown only on a terminal."""
+
+    def __init__(self, label, total):
+        self.label = label
+        self.total = total
+        self.enabled = sys.stderr.isatty() and total > 1
+
+    def update(self, done):
+        if self.enabled:
+            print(f"\r{self.label} {done}/{self.total}", end="",
+                  file=sys.stderr, flush=True)
+
+    def finish(self):
+        if self.enabled:
+            print("\r\033[K", end="", file=sys.stderr, flush=True)
+
+
+# Time
 
 def parse_iso(value):
     """Return an aware datetime for an ISO timestamp, or None."""
@@ -132,13 +394,13 @@ def format_age(value):
     if stamp is None:
         return "?"
     now = datetime.datetime.now(datetime.timezone.utc)
-    seconds = (now - stamp).total_seconds()
+    seconds = max((now - stamp).total_seconds(), 0)
     if seconds < 3600:
-        return "{}m".format(max(int(seconds // 60), 0))
+        return f"{int(seconds // 60)}m"
     if seconds < 86400:
-        return "{}h".format(int(seconds // 3600))
+        return f"{int(seconds // 3600)}h"
     if seconds < 86400 * 14:
-        return "{}d".format(int(seconds // 86400))
+        return f"{int(seconds // 86400)}d"
     return stamp.astimezone().strftime("%d.%m.%y")
 
 
@@ -151,6 +413,23 @@ def format_local(value):
 
 
 # Transcript parsing
+#
+# Transcripts reach hundreds of megabytes. Most lines are API request
+# blobs or tool output that carry nothing for the list, so cheap string
+# checks decide which lines are worth decoding as JSON at all.
+
+RE_TIMESTAMP = re.compile(r'"timestamp":"([^"]+)"')
+RE_ENTRYPOINT = re.compile(r'"entrypoint":"([^"]+)"')
+RE_KIND = re.compile(r'"sessionKind":"([^"]+)"')
+RE_CWD = re.compile(r'"cwd":"((?:[^"\\]|\\.)*)"')
+RE_BRANCH = re.compile(r'"gitBranch":"((?:[^"\\]|\\.)*)"')
+RE_COMMAND = re.compile(r"<command-name>([^<]+)</command-name>")
+RE_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f-]{27}$")
+
+SKIPPED_TYPED_RECORDS = ('{"type":"api-request', '{"type":"file-history',
+                         '{"type":"attachment"')
+PROMPT_LIMIT = 500
+
 
 def parse_record(line):
     """Return the JSON object of one transcript line, or None."""
@@ -172,12 +451,16 @@ def message_text(content):
     return "\n".join(parts)
 
 
+def record_text(record):
+    """Return the message text of a user or assistant record."""
+    return message_text((record.get("message") or {}).get("content"))
+
+
 def prompt_text(record):
     """Return the human prompt of a user record, or None."""
     if record.get("isMeta") or record.get("isCompactSummary"):
         return None
-    message = record.get("message") or {}
-    text = message_text(message.get("content")).strip()
+    text = record_text(record).strip()
     command = RE_COMMAND.search(text)
     if command:
         return command.group(1).strip()
@@ -186,14 +469,15 @@ def prompt_text(record):
     return text
 
 
-def empty_meta():
-    """Return a metadata dict with all fields unset."""
-    return {
-        "cwd": None, "branch": None, "first": None, "last": None,
-        "titles": {}, "first_prompt": None, "last_prompt": None,
-        "prompts": 0, "continued_in": None, "cost": None, "prs": [],
-        "entrypoints": [], "kind": None,
-    }
+def is_typed_line(line):
+    """Return True for small records that carry session metadata."""
+    return (line.startswith('{"type":"')
+            and not line.startswith(SKIPPED_TYPED_RECORDS))
+
+
+def is_prompt_line(line):
+    """Return True for user lines that may hold a human prompt."""
+    return '"type":"user"' in line and '"tool_result"' not in line
 
 
 def apply_typed_record(meta, record):
@@ -202,14 +486,15 @@ def apply_typed_record(meta, record):
     if kind in TITLE_TYPES:
         key, source = TITLE_TYPES[kind]
         if record.get(key):
-            meta["titles"][source] = record[key]
+            meta.titles[source] = record[key]
     elif kind == "continued-in":
-        meta["continued_in"] = record.get("continuedInSessionId")
+        meta.continued_in = record.get("continuedInSessionId")
     elif kind == "cost-state":
-        meta["cost"] = record.get("totalCostUSD")
-    elif kind == "pr-link" and record.get("prUrl"):
-        if record["prUrl"] not in meta["prs"]:
-            meta["prs"].append(record["prUrl"])
+        meta.cost = record.get("totalCostUSD")
+    elif kind == "pr-link":
+        url = record.get("prUrl")
+        if url and url not in meta.prs:
+            meta.prs.append(url)
 
 
 def apply_user_record(meta, record):
@@ -217,45 +502,39 @@ def apply_user_record(meta, record):
     text = prompt_text(record)
     if text is None:
         return
-    meta["prompts"] += 1
-    meta["first_prompt"] = meta["first_prompt"] or text[:500]
-    meta["last_prompt"] = text[:500]
+    meta.prompts += 1
+    meta.first_prompt = meta.first_prompt or text[:PROMPT_LIMIT]
+    meta.last_prompt = text[:PROMPT_LIMIT]
+
+
+def apply_timestamp(meta, line):
+    """Widen the first/last activity span by the line's timestamp."""
+    match = RE_TIMESTAMP.search(line)
+    if not match:
+        return
+    stamp = match.group(1)
+    # ISO timestamps in one format compare correctly as strings
+    if meta.first is None or stamp < meta.first:
+        meta.first = stamp
+    if meta.last is None or stamp > meta.last:
+        meta.last = stamp
 
 
 def apply_context(meta, line):
-    """Pick up timestamp, cwd and branch from a raw line."""
-    stamp = RE_TIMESTAMP.search(line)
-    if stamp:
-        value = stamp.group(1)
-        if meta["first"] is None or value < meta["first"]:
-            meta["first"] = value
-        if meta["last"] is None or value > meta["last"]:
-            meta["last"] = value
-    if meta["cwd"] is None:
+    """Pick up directory, branch, entrypoint and kind from a line."""
+    if meta.cwd is None:
         cwd = RE_CWD.search(line)
         if cwd:
-            meta["cwd"] = json.loads('"' + cwd.group(1) + '"')
+            meta.cwd = json.loads('"' + cwd.group(1) + '"')
     branch = RE_BRANCH.search(line)
     if branch:
-        meta["branch"] = branch.group(1)
+        meta.branch = branch.group(1)
     entrypoint = RE_ENTRYPOINT.search(line)
-    if entrypoint and entrypoint.group(1) not in meta["entrypoints"]:
-        meta["entrypoints"].append(entrypoint.group(1))
+    if entrypoint and entrypoint.group(1) not in meta.entrypoints:
+        meta.entrypoints.append(entrypoint.group(1))
     kind = RE_KIND.search(line)
     if kind:
-        meta["kind"] = kind.group(1)
-
-
-def is_typed_line(line):
-    """Return True for small records that carry session metadata."""
-    return line.startswith('{"type":"') and not line.startswith(
-        ('{"type":"api-request', '{"type":"file-history',
-         '{"type":"attachment"'))
-
-
-def is_prompt_line(line):
-    """Return True for user lines that may hold a human prompt."""
-    return '"type":"user"' in line and '"tool_result"' not in line
+        meta.kind = kind.group(1)
 
 
 def apply_line(meta, line):
@@ -268,43 +547,34 @@ def apply_line(meta, line):
     elif record:
         apply_typed_record(meta, record)
     if '"timestamp"' in line:
+        apply_timestamp(meta, line)
         apply_context(meta, line)
 
 
 def read_meta(path):
     """Parse one transcript and return its metadata."""
-    meta = empty_meta()
+    meta = Meta()
     with open(path, errors="replace") as handle:
         for line in handle:
             apply_line(meta, line)
     return meta
 
 
-# Session index
+# Cache
 
-def iter_transcripts():
-    """Yield the paths of all top level session transcripts."""
-    if not os.path.isdir(PROJECTS):
-        return
-    for slug in sorted(os.listdir(PROJECTS)):
-        project = os.path.join(PROJECTS, slug)
-        if not os.path.isdir(project):
-            continue
-        for entry in sorted(os.listdir(project)):
-            if entry.endswith(".jsonl") and RE_UUID.match(entry[:-6]):
-                yield os.path.join(project, entry)
+def file_key(path):
+    """Return what invalidates a cache entry: mtime and size."""
+    stat = os.stat(path)
+    return [stat.st_mtime_ns, stat.st_size]
 
 
-def load_cache():
-    """Return the cached metadata keyed by transcript path."""
+def read_json(path):
+    """Return the parsed JSON of a file, or None if unreadable."""
     try:
-        with open(CACHE) as handle:
-            data = json.load(handle)
+        with open(path) as handle:
+            return json.load(handle)
     except (OSError, ValueError):
-        return {}
-    if data.get("version") != CACHE_VERSION:
-        return {}
-    return data.get("entries", {})
+        return None
 
 
 def write_private_json(path, data):
@@ -322,76 +592,108 @@ def write_private_json(path, data):
     os.replace(temp, path)
 
 
-def save_cache(entries):
-    """Write the metadata cache."""
-    write_private_json(CACHE, {"version": CACHE_VERSION,
-                               "entries": entries})
+class TranscriptCache:
+    """JSON data per transcript, valid while its file key matches."""
+
+    def __init__(self, path, version):
+        self.path = path
+        self.version = version
+        data = read_json(path)
+        valid = isinstance(data, dict) and data.get("version") == version
+        self.entries = data.get("entries", {}) if valid else {}
+        self.changed = not valid
+
+    def get(self, transcript, key):
+        """Return cached data for a transcript, or None if stale."""
+        entry = self.entries.get(transcript)
+        if entry and entry.get("key") == key:
+            return entry["data"]
+        return None
+
+    def put(self, transcript, key, data):
+        """Store data computed from the transcript as it was at key."""
+        self.entries[transcript] = {"key": key, "data": data}
+        self.changed = True
+
+    def save(self):
+        """Write the cache, dropping transcripts that no longer exist."""
+        alive = {path: entry for path, entry in self.entries.items()
+                 if os.path.exists(path)}
+        if not self.changed and len(alive) == len(self.entries):
+            return
+        write_private_json(self.path, {"version": self.version,
+                                       "entries": alive})
 
 
-def file_key(path):
-    """Return the cache validity key (mtime, size) of a file."""
-    stat = os.stat(path)
-    return [stat.st_mtime_ns, stat.st_size]
+# Session index
+
+def iter_transcripts():
+    """Yield the paths of all top level session transcripts."""
+    if not os.path.isdir(PROJECTS):
+        return
+    for slug in sorted(os.listdir(PROJECTS)):
+        project = os.path.join(PROJECTS, slug)
+        if not os.path.isdir(project):
+            continue
+        for entry in sorted(os.listdir(project)):
+            if entry.endswith(".jsonl") and RE_UUID.match(entry[:-6]):
+                yield os.path.join(project, entry)
 
 
-def cached_meta(path, cache):
-    """Return metadata from the cache, parsing the file if stale."""
+def load_meta(path, cache):
+    """Return the metadata of a transcript, from the cache if fresh."""
+    # The key is taken before reading, so a transcript that grows
+    # while it is parsed is parsed again next time
     key = file_key(path)
-    entry = cache.get(path)
-    if entry and entry.get("key") == key:
-        return entry["meta"]
+    data = cache.get(path, key)
+    if data is not None:
+        return Meta(**data)
     meta = read_meta(path)
-    cache[path] = {"key": key, "meta": meta}
+    cache.put(path, key, dataclasses.asdict(meta))
     return meta
 
 
 def pick_title(meta):
     """Return (title, source) with the best available title."""
-    titles = meta["titles"]
     for source in ("user", "agent", "ai"):
-        if titles.get(source):
-            return titles[source], source
-    if meta["first_prompt"]:
-        return meta["first_prompt"], "prompt"
+        if meta.titles.get(source):
+            return meta.titles[source], source
+    if meta.first_prompt:
+        return meta.first_prompt, "prompt"
     return "", None
 
 
 def decode_slug(slug):
-    """Guess a directory from a project slug (lossy fallback)."""
+    """Guess a directory from a project folder name (lossy)."""
     return slug.replace("-", "/")
 
 
-def build_session(path, meta):
-    """Combine path and metadata into a session dict."""
+def build_session(path, meta, process=None):
+    """Combine a transcript path, its metadata and its process."""
     title, source = pick_title(meta)
+    values = dataclasses.asdict(meta)
     slug = os.path.basename(os.path.dirname(path))
-    session = dict(meta)
-    session.update({
-        "id": os.path.basename(path)[:-6],
-        "path": path,
-        "cwd": meta["cwd"] or decode_slug(slug),
-        "title": title,
-        "title_source": source,
-        "size": os.path.getsize(path),
-        "live": None,
-    })
-    return session
+    values["cwd"] = meta.cwd or decode_slug(slug)
+    return Session(**values, id=os.path.basename(path)[:-6], path=path,
+                   size=os.path.getsize(path), title=title,
+                   title_source=source, process=process)
 
 
 def load_sessions():
-    """Return all sessions, newest activity first."""
-    cache = load_cache()
-    paths = list(iter_transcripts())
-    sessions = [build_session(p, cached_meta(p, cache)) for p in paths]
-    save_cache({p: cache[p] for p in paths if p in cache})
-    live = load_live()
-    for session in sessions:
-        session["live"] = live.get(session["id"])
-    sessions.sort(key=lambda s: s["last"] or "", reverse=True)
+    """Return all sessions, most recently active first."""
+    cache = TranscriptCache(CACHE, CACHE_VERSION)
+    processes = load_processes()
+    sessions = []
+    for path in iter_transcripts():
+        session_id = os.path.basename(path)[:-6]
+        meta = load_meta(path, cache)
+        sessions.append(build_session(path, meta, processes.get(session_id)))
+    cache.save()
+    sessions.sort(key=lambda s: s.last or "", reverse=True)
     return sessions
 
 
-# Live sessions
+# Running sessions
 
 def pid_alive(pid):
     """Return True when a process with this pid exists."""
@@ -404,31 +706,33 @@ def pid_alive(pid):
     return True
 
 
-def read_live_entry(path):
-    """Return a registry entry if its process still runs."""
-    try:
-        with open(path) as handle:
-            entry = json.load(handle)
-    except (OSError, ValueError):
+def read_registry_entry(path):
+    """Return (session id, Process) of a live registry entry, or None."""
+    entry = read_json(path)
+    if not isinstance(entry, dict):
         return None
     pid = entry.get("pid")
-    if not isinstance(pid, int) or not pid_alive(pid):
+    session_id = entry.get("sessionId")
+    if not isinstance(pid, int) or not session_id or not pid_alive(pid):
         return None
-    return entry
+    process = Process(pid=pid, kind=entry.get("kind") or "interactive",
+                      status=entry.get("status") or "?",
+                      entrypoint=entry.get("entrypoint"))
+    return session_id, process
 
 
-def load_live():
-    """Return running sessions from the registry keyed by id."""
+def load_processes():
+    """Return running Claude Code processes keyed by session id."""
     if not os.path.isdir(REGISTRY):
         return {}
-    live = {}
-    for entry in os.listdir(REGISTRY):
-        if not entry.endswith(".json"):
+    found = {}
+    for name in os.listdir(REGISTRY):
+        if not name.endswith(".json"):
             continue
-        info = read_live_entry(os.path.join(REGISTRY, entry))
-        if info and info.get("sessionId"):
-            live[info["sessionId"]] = info
-    return live
+        entry = read_registry_entry(os.path.join(REGISTRY, name))
+        if entry:
+            found[entry[0]] = entry[1]
+    return found
 
 
 def process_tty(pid):
@@ -439,210 +743,646 @@ def process_tty(pid):
     return tty if tty and tty != "??" else None
 
 
-def live_label(session):
-    """Return a short status label for a running session."""
-    live = session["live"]
-    if not live:
-        return ""
-    kind = "bg" if live.get("kind") == "bg" else "run"
-    return "{}:{}".format(kind, live.get("status") or "?")
-
-
-# Origin
-
-def entrypoints(session):
-    """Return the entrypoints of a session, oldest first."""
-    found = list(session["entrypoints"])
-    live = session["live"] or {}
-    if live.get("entrypoint") and live["entrypoint"] not in found:
-        found.append(live["entrypoint"])
-    return found
-
-
-def origin(session):
-    """Return where a session was started: app, term or other."""
-    found = entrypoints(session)
-    if not found:
-        return "?"
-    return ENTRYPOINT_LABELS.get(found[0], found[0])
-
-
-def source_label(session):
-    """Return the origin, followed by later origins such as app>term."""
-    labels = [ENTRYPOINT_LABELS.get(e, e) for e in entrypoints(session)]
-    label = ">".join(labels) or "?"
-    if session["kind"] == "bg":
-        label += " bg"
-    return label
-
-
-def is_named(session):
-    """Return True when the session has a title you set."""
-    return session["title_source"] in NAMED_SOURCES
-
-
-# Filtering and lookup
-
-def search_text(session):
-    """Return the lowercased text that list queries match against."""
-    fields = [session["title"], session["cwd"], session["id"],
-              session["first_prompt"], session["branch"]]
-    fields.extend(session["titles"].values())
-    return " ".join(f for f in fields if f).lower()
-
-
-def matches(session, terms):
-    """Return True when every query term occurs in the session."""
-    text = search_text(session)
-    return all(term.lower() in text for term in terms)
-
-
-def is_visible(session, show_all):
-    """Hide empty and superseded sessions unless show_all is set."""
-    if show_all or session["live"]:
-        return True
-    return session["prompts"] > 0 and not session["continued_in"]
-
-
-def in_directory(session, directory):
-    """Return True when the session ran in or below directory."""
-    cwd = session["cwd"] or ""
-    return cwd == directory or cwd.startswith(directory + os.sep)
-
-
-def keep_session(session, args):
-    """Return True when a session passes all list filters."""
-    if not is_visible(session, args.all):
-        return False
-    if args.named is not None and is_named(session) != args.named:
-        return False
-    if args.origin and origin(session) != args.origin:
-        return False
-    if args.here and not in_directory(session, os.getcwd()):
-        return False
-    return matches(session, args.query)
-
-
-def sort_sessions(sessions, key, reverse):
-    """Return sessions ordered by a SORT_KEYS key."""
-    function, descending = SORT_KEYS[key]
-    return sorted(sessions, key=function, reverse=descending != reverse)
-
-
-def select_sessions(args, sessions):
-    """Return the filtered, sorted and limited sessions."""
-    selected = [s for s in sessions if keep_session(s, args)]
-    selected = sort_sessions(selected, args.sort, args.reverse)
-    return selected[: args.limit] if args.limit else selected
-
-
-def resolve(sessions, ref, newest=False):
-    """Return the one session matching an id prefix or title.
-
-    With newest set, a title shared by several sessions resolves to
-    the most recently active one instead of being ambiguous.
-    """
-    ref_lower = ref.lower()
-    by_id = [s for s in sessions if s["id"].startswith(ref_lower)]
-    if len(by_id) == 1:
-        return by_id[0]
-    exact = [s for s in sessions if s["title"].lower() == ref_lower]
-    if len(exact) == 1 or (exact and newest):
-        return exact[0]
-    fuzzy = by_id or exact or [
-        s for s in sessions if ref_lower in s["title"].lower()]
-    if len(fuzzy) == 1:
-        return fuzzy[0]
-    if not fuzzy:
-        fail("no session matches {!r}".format(ref))
-    print("claudes: {!r} is ambiguous:".format(ref), file=sys.stderr)
-    for session in fuzzy[:20]:
-        print("  " + format_row(session), file=sys.stderr)
-    sys.exit(1)
-
-
-# Rendering
-
-def title_cell(session, width):
-    """Return the title column, dimmed when it is only a prompt."""
-    text = clip(session["title"], width)
-    if session["title_source"] == "user":
-        return paint(text, "1")
-    if session["title_source"] == "prompt":
-        return paint(text, "2")
-    return text
-
-
-def format_row(session):
-    """Return one list line for a session."""
-    status = live_label(session)
-    status_cell = paint(clip(status, 9), "32") if status else " " * 9
-    return "  ".join([
-        paint(session["id"][:8], "33"),
-        format_age(session["last"]).rjust(8),
-        status_cell,
-        paint(clip(source_label(session), 8), "35"),
-        title_cell(session, 36),
-        paint(clip(short_path(session["cwd"]), 32), "36"),
-        str(session["prompts"]).rjust(4),
-    ])
-
-
-def header_row():
-    """Return the column header line."""
-    return paint("  ".join([
-        "id".ljust(8), "active".rjust(8), "status".ljust(9),
-        "source".ljust(8), "title".ljust(36), "directory".ljust(32),
-        "msgs",
-    ]), "4")
-
-
-def show_session(session):
-    """Print every known detail of one session."""
-    rows = [
-        ("id", session["id"]),
-        ("title", "{} ({})".format(session["title"],
-                                   session["title_source"])),
-        ("directory", short_path(session["cwd"])),
-        ("source", source_label(session)),
-        ("branch", session["branch"]),
-        ("started", format_local(session["first"])),
-        ("active", format_local(session["last"])),
-        ("prompts", session["prompts"]),
-        ("size", "{:.1f} MB".format(session["size"] / 1e6)),
-        ("cost", session["cost"] and "${:.2f}".format(session["cost"])),
-        ("status", live_status_detail(session)),
-        ("continued", session["continued_in"]),
-        ("file", short_path(session["path"])),
-    ]
-    rows.extend(("pr", url) for url in session["prs"])
-    for label, value in rows:
-        if value not in (None, "", []):
-            print("{:<10} {}".format(paint(label, "2"), value))
-    for label in ("first_prompt", "last_prompt"):
-        print("\n" + paint(label.replace("_", " "), "2"))
-        print(session[label] or "-")
-
-
-def live_status_detail(session):
-    """Return pid, kind and terminal of a running session."""
-    live = session["live"]
-    if not live:
-        return None
-    tty = process_tty(live["pid"])
-    parts = ["pid {}".format(live["pid"]), live.get("kind") or "?",
-             live.get("status") or "?"]
+def process_detail(process):
+    """Return pid, kind, status and terminal of a process."""
+    parts = [f"pid {process.pid}", process.kind, process.status]
+    tty = process_tty(process.pid)
     if tty:
         parts.append("tty " + tty)
     return ", ".join(parts)
 
 
+# Selecting sessions
+
+def search_text(session):
+    """Return the lowercased text that queries match against."""
+    fields = [session.title, session.cwd, session.id, session.branch,
+              session.first_prompt, session.last_prompt]
+    fields.extend(session.titles.values())
+    return " ".join(f for f in fields if f).lower()
+
+
+def matches_query(session, terms):
+    """Return True when every query term occurs in the session."""
+    if not terms:
+        return True
+    text = search_text(session)
+    return all(term.lower() in text for term in terms)
+
+
+def in_directory(session, directory):
+    """Return True when the session ran in or below directory."""
+    cwd = session.cwd or ""
+    return cwd == directory or cwd.startswith(directory + os.sep)
+
+
+def idle_seconds(session):
+    """Return the seconds since the last activity of a session."""
+    stamp = parse_iso(session.last)
+    if stamp is None:
+        return float("inf")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now - stamp).total_seconds()
+
+
+def in_age_range(session, older, newer):
+    """Return True when the idle time lies within older and newer."""
+    if older is None and newer is None:
+        return True
+    idle = idle_seconds(session)
+    return ((older is None or idle >= older)
+            and (newer is None or idle <= newer))
+
+
+def has_id(session, ids):
+    """Return True when the session id starts with one of ids."""
+    return ids is None or any(session.id.startswith(i) for i in ids)
+
+
+def passes(session, filters):
+    """Return True when a session passes every filter."""
+    return all((
+        filters.include_hidden or not session.is_hidden,
+        filters.named is None or session.is_named == filters.named,
+        filters.origin is None or session.origin == filters.origin,
+        filters.directory is None or session.cwd == filters.directory,
+        filters.under is None or in_directory(session, filters.under),
+        in_age_range(session, filters.older, filters.newer),
+        has_id(session, filters.ids),
+        matches_query(session, filters.query),
+    ))
+
+
+def sort_sessions(sessions, key, reverse=False):
+    """Return sessions ordered by one of the SORT_KEYS."""
+    function, descending = SORT_KEYS[key]
+    return sorted(sessions, key=function, reverse=descending != reverse)
+
+
+def select_sessions(sessions, filters):
+    """Return the filtered, sorted and limited sessions."""
+    selected = [s for s in sessions if passes(s, filters)]
+    selected = sort_sessions(selected, filters.sort, filters.reverse)
+    return selected[: filters.limit] if filters.limit else selected
+
+
+# Finding one session
+
+def find_candidates(sessions, ref, newest=False):
+    """Return the sessions a reference could mean.
+
+    An id prefix wins, then an exact title, then a part of a title.
+    With newest set, a title shared by several sessions means the most
+    recently active one; sessions arrive sorted that way.
+    """
+    ref = ref.lower()
+    by_id = [s for s in sessions if s.id.startswith(ref)]
+    if len(by_id) == 1:
+        return by_id
+    exact = [s for s in sessions if s.title.lower() == ref]
+    if exact and (newest or len(exact) == 1):
+        return exact[:1]
+    if by_id or exact:
+        return by_id or exact
+    return [s for s in sessions if ref in s.title.lower()]
+
+
+def report_ambiguous(ref, candidates):
+    """List the candidates for an ambiguous reference and exit."""
+    print(f"claudes: {ref!r} matches {len(candidates)} sessions:",
+          file=sys.stderr)
+    for session in candidates[:20]:
+        print("  " + format_row(session), file=sys.stderr)
+    print("Use a longer id prefix or the full title.", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve(sessions, ref, newest=False):
+    """Return the one session ref means; let the user pick if needed."""
+    candidates = find_candidates(sessions, ref, newest)
+    if not candidates:
+        fail(f"no session matches {ref!r}")
+    if len(candidates) == 1:
+        return candidates[0]
+    if not can_pick():
+        report_ambiguous(ref, candidates)
+    chosen = fzf_select(candidates,
+                        header=f"{ref!r} matches several sessions")
+    if chosen is None:
+        sys.exit(1)
+    return chosen
+
+
+def resolve_id(sessions, token):
+    """Return the session an id prefix from a pipe names.
+
+    Piped input is matched by id only and never opens a picker: a
+    script must not act on a session nobody chose.
+    """
+    found = [s for s in sessions if s.id.startswith(token)]
+    if len(found) != 1:
+        problem = "no session" if not found else f"{len(found)} sessions"
+        fail(f"piped id {token!r} matches {problem}")
+    return found[0]
+
+
+def sessions_from_refs(sessions, refs, newest=False):
+    """Return the sessions for refs, where "-" reads ids from stdin."""
+    found = []
+    for ref in refs:
+        if ref == "-":
+            found += [resolve_id(sessions, t) for t in read_ids("-")]
+        else:
+            found.append(resolve(sessions, ref, newest))
+    return list({session.id: session for session in found}.values())
+
+
+# Table layout
+
+FIXED_WIDTHS = {"id": 8, "active": 8, "status": 9, "source": 8, "msgs": 4}
+GAP = "  "
+PIPE_WIDTH = 130
+
+
+@dataclass
+class Layout:
+    """Widths of the two flexible columns."""
+
+    title: int
+    directory: int
+
+
+def table_layout():
+    """Split the terminal width left by fixed columns: title, directory."""
+    if sys.stdout.isatty():
+        width = shutil.get_terminal_size((PIPE_WIDTH, 24)).columns
+    else:
+        width = PIPE_WIDTH
+    fixed = sum(FIXED_WIDTHS.values()) + len(GAP) * 6
+    room = max(width - fixed, 40)
+    title = room * 11 // 20
+    return Layout(title=title, directory=room - title)
+
+
+def title_cell(session, width):
+    """Return the title: bold if you named it, dim if only a prompt."""
+    text = clip(session.title, width)
+    if session.title_source == "user":
+        return paint(text, "1")
+    if session.title_source == "prompt":
+        return dim(text)
+    return text
+
+
+def status_cell(session):
+    """Return the running state, green, or blank."""
+    width = FIXED_WIDTHS["status"]
+    if not session.is_running:
+        return " " * width
+    return paint(clip(session.process.label, width), "32")
+
+
+def format_row(session, layout=None):
+    """Return one table line for a session."""
+    layout = layout or table_layout()
+    return GAP.join([
+        paint(session.short_id, "33"),
+        format_age(session.last).rjust(FIXED_WIDTHS["active"]),
+        status_cell(session),
+        paint(clip(session.source, FIXED_WIDTHS["source"]), "35"),
+        title_cell(session, layout.title),
+        paint(clip(short_path(session.cwd), layout.directory), "36"),
+        str(session.prompts).rjust(FIXED_WIDTHS["msgs"]),
+    ])
+
+
+def header_row(layout=None):
+    """Return the column header line."""
+    layout = layout or table_layout()
+    return paint(GAP.join([
+        "id".ljust(FIXED_WIDTHS["id"]),
+        "active".rjust(FIXED_WIDTHS["active"]),
+        "status".ljust(FIXED_WIDTHS["status"]),
+        "source".ljust(FIXED_WIDTHS["source"]),
+        "title".ljust(layout.title),
+        "directory".ljust(layout.directory),
+        "msgs".rjust(FIXED_WIDTHS["msgs"]),
+    ]), "4")
+
+
+def session_json(session):
+    """Return the public fields of a session for --json output."""
+    return {
+        "id": session.id,
+        "title": session.title,
+        "title_source": session.title_source,
+        "directory": session.cwd,
+        "branch": session.branch,
+        "source": session.source,
+        "started": session.first,
+        "active": session.last,
+        "prompts": session.prompts,
+        "cost": session.cost,
+        "size": session.size,
+        "running": session.process.label if session.process else None,
+        "continued_in": session.continued_in,
+        "prs": session.prs,
+        "path": session.path,
+    }
+
+
+# fzf picker
+
+CLIPBOARD_COMMANDS = ("pbcopy", "wl-copy", "xclip -selection clipboard")
+
+
+def can_pick():
+    """Return True when an interactive fzf picker can be shown."""
+    return is_interactive() and shutil.which("fzf") is not None
+
+
+def clipboard_command():
+    """Return a shell command that copies stdin, or None."""
+    for command in CLIPBOARD_COMMANDS:
+        if shutil.which(command.split()[0]):
+            return command
+    return None
+
+
+def own_command():
+    """Return a shell word that runs this script again."""
+    return shlex.quote(os.path.realpath(sys.argv[0]))
+
+
+def fzf_command(query, header):
+    """Return the fzf command line for the session picker."""
+    copy = clipboard_command()
+    hints = "Enter: choose" + ("   ctrl-y: copy id" if copy else "")
+    command = [
+        "fzf", "--ansi", "--no-sort", "--layout=reverse",
+        "--delimiter", "\t", "--with-nth", "2..", "--header-lines", "1",
+        "--prompt", "session> ", "--query", query,
+        "--header", f"{header}\n{hints}" if header else hints,
+        "--preview", f"CLICOLOR_FORCE=1 {own_command()} show {{1}}",
+        "--preview-window", "down,45%,wrap",
+    ]
+    if copy:
+        command += ["--bind", f"ctrl-y:execute-silent(printf %s {{1}} "
+                              f"| {copy})"]
+    return command
+
+
+def fzf_select(sessions, query="", header=""):
+    """Let the user choose one session with fzf; None on cancel."""
+    with forced_color():
+        layout = table_layout()
+        lines = ["\t" + header_row(layout)]
+        lines += [f"{s.id}\t{format_row(s, layout)}" for s in sessions]
+    result = subprocess.run(fzf_command(query, header),
+                            input="\n".join(lines), text=True,
+                            stdout=subprocess.PIPE)
+    chosen = result.stdout.split("\t", 1)[0].strip()
+    return next((s for s in sessions if s.id == chosen), None)
+
+
+# Commands: browsing
+
+def print_list_footer(shown, total_visible, total):
+    """Tell how many sessions are shown and how many are hidden."""
+    parts = [f"{shown} of {total_visible} sessions"]
+    hidden = total - total_visible
+    if hidden:
+        parts.append(f"{hidden} empty or continued hidden (-a)")
+    print(dim(", ".join(parts)))
+
+
+def format_session(session, template):
+    """Fill a --format template with the fields of a session."""
+    fields = session_json(session)
+    fields["short_id"] = session.short_id
+    try:
+        return template.format_map(fields)
+    except (KeyError, ValueError) as error:
+        fail(f"bad --format {template!r} ({error}); fields: "
+             + ", ".join(fields))
+
+
+def cmd_list(args, sessions):
+    """Print the session table, or ids, a template, or JSON."""
+    filters = Filters.from_args(args)
+    selected = select_sessions(sessions, filters)
+    if args.json:
+        json.dump([session_json(s) for s in selected], sys.stdout,
+                  indent=2)
+        print()
+        return
+    template = "{id}" if args.ids else args.format
+    if template:
+        for session in selected:
+            print(format_session(session, template))
+        return
+    interactive = sys.stdout.isatty()
+    layout = table_layout()
+    if interactive:
+        print(header_row(layout))
+    for session in selected:
+        print(format_row(session, layout))
+    if interactive:
+        unlimited = dataclasses.replace(filters, limit=0)
+        visible = len(select_sessions(sessions, unlimited))
+        print_list_footer(len(selected), visible, len(sessions))
+
+
+def cmd_pick(args, sessions):
+    """Choose a session with fzf and resume it."""
+    if not can_pick():
+        fail("pick needs fzf and a terminal")
+    # The query goes to fzf as an editable search instead of a filter
+    filters = Filters.from_args(args, query=[])
+    chosen = fzf_select(select_sessions(sessions, filters),
+                        query=" ".join(args.query))
+    if chosen:
+        resume_session(chosen, fork=False)
+
+
+def detail_rows(session):
+    """Return (label, value) pairs for the details view."""
+    source = TITLE_SOURCE_LABELS.get(session.title_source, "none")
+    cost = f"${session.cost:.2f}" if session.cost else None
+    rows = [
+        ("id", session.id),
+        ("title", f"{session.title}  {dim('(' + source + ')')}"),
+        ("directory", short_path(session.cwd)),
+        ("source", session.source),
+        ("branch", session.branch),
+        ("started", format_local(session.first)),
+        ("active", format_local(session.last)),
+        ("prompts", session.prompts),
+        ("size", f"{session.size / 1e6:.1f} MB"),
+        ("cost", cost),
+        ("running", session.process and process_detail(session.process)),
+        ("continued", session.continued_in),
+        ("file", short_path(session.path)),
+    ]
+    rows.extend(("pr", url) for url in session.prs)
+    rows.append(("resume", f"claudes -r {session.short_id}"))
+    return rows
+
+
+def print_details(session):
+    """Print every known detail of one session."""
+    for label, value in detail_rows(session):
+        if value not in (None, "", []):
+            print(f"{dim(label.ljust(10))} {value}")
+    for label, text in (("first prompt", session.first_prompt),
+                        ("last prompt", session.last_prompt)):
+        print("\n" + dim(label))
+        print(text or "-")
+
+
+def cmd_show(args, sessions):
+    """Print details of the given sessions."""
+    for number, session in enumerate(
+            sessions_from_refs(sessions, args.refs, newest=True)):
+        if number:
+            print("\n" + dim("-" * 40) + "\n")
+        print_details(session)
+
+
+# Commands: resume and review
+
+def enter_directory(path):
+    """Change into a session directory, or exit with an explanation."""
+    if not os.path.isdir(path):
+        fail(f"directory is gone: {short_path(path)}\n"
+             "Recreate it, then resume again.")
+    os.chdir(path)
+    print("cd " + short_path(path), file=sys.stderr)
+
+
+def resume_argv(session, fork):
+    """Return the claude command line that reopens a session."""
+    if session.process and session.process.is_background:
+        return ["claude", "attach", session.id]
+    argv = ["claude", "--resume", session.id]
+    return argv + ["--fork-session"] if fork else argv
+
+
+def resume_session(session, fork):
+    """Replace this process with claude resuming the session."""
+    process = session.process
+    if process and not process.is_background and not fork:
+        fail(f"session is open in another terminal "
+             f"({process_detail(process)}).\n"
+             "Switch to it, or use --fork to branch off a copy.")
+    enter_directory(session.cwd)
+    argv = resume_argv(session, fork)
+    os.execvp(argv[0], argv)
+
+
+def cmd_resume(args, sessions):
+    """Resume a session given by reference, or picked with fzf."""
+    if args.ref:
+        session = resolve(sessions, args.ref, newest=True)
+    elif can_pick():
+        visible = select_sessions(sessions, Filters())
+        session = fzf_select(visible)
+    else:
+        fail("which session? Give an id prefix or a title.")
+    if session:
+        resume_session(session, args.fork)
+
+
+def review_target(sessions, ref):
+    """Return (directory, label) for a session or directory ref."""
+    if os.path.isdir(ref):
+        path = os.path.abspath(ref)
+        return path, os.path.basename(path)
+    session = resolve(sessions, ref, newest=True)
+    return session.cwd, session.title or session.short_id
+
+
+def is_git_repo(path):
+    """Return True when path lies inside a git work tree."""
+    result = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def cmd_review(args, sessions):
+    """Start a new claude session running /security-review."""
+    path, label = review_target(sessions, args.ref)
+    if os.path.isdir(path) and not is_git_repo(path):
+        fail("not a git repository: " + short_path(path))
+    enter_directory(path)
+    prompt = " ".join(["/security-review"] + args.focus)
+    name = "security-review " + clip(label, 40).strip()
+    os.execvp("claude", ["claude", "-n", name, prompt])
+
+
+# Commands: managing
+
+def ensure_idle(session, action):
+    """Exit when a session is running and must not be changed."""
+    if session.is_running:
+        fail(f"cannot {action} {session.short_id} while it runs "
+             f"({process_detail(session.process)})")
+
+
+def cmd_rename(args, sessions):
+    """Append a custom-title record, as /rename does."""
+    session = resolve(sessions, args.ref)
+    ensure_idle(session, "rename")
+    record = {"type": "custom-title", "customTitle": args.name,
+              "sessionId": session.id}
+    with open(session.path, "a") as handle:
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    print(f"renamed {session.short_id} to {args.name!r}")
+
+
+def ask(question):
+    """Return the answer typed at the terminal, even behind a pipe.
+
+    When stdin carries piped ids, the question goes to /dev/tty, so
+    "claudes -q ... | claudes rm -" still asks before it moves.
+    """
+    if sys.stdin.isatty():
+        return input(question)
+    with open("/dev/tty", "r+") as tty:
+        tty.write(question)
+        tty.flush()
+        return tty.readline()
+
+
+def confirm(question):
+    """Ask a yes/no question on the terminal; default is no."""
+    try:
+        answer = ask(question + " [y/N] ")
+    except (EOFError, OSError):
+        fail("no terminal to confirm on; add -y to skip the question")
+    return answer.strip().lower() in ("y", "yes", "j", "ja")
+
+
+def trash_session(session):
+    """Move a transcript and its sidecar directory to the Trash."""
+    project = os.path.basename(os.path.dirname(session.path))
+    target = os.path.join(TRASH, project)
+    os.makedirs(target, exist_ok=True)
+    sidecar = session.path[: -len(".jsonl")]
+    for path in (session.path, sidecar):
+        if os.path.exists(path):
+            shutil.move(path, os.path.join(target, os.path.basename(path)))
+
+
+def removal_targets(args, sessions, filters):
+    """Return the sessions rm should move, without duplicates.
+
+    Named sessions, piped ids and filter matches add up. Filters see
+    hidden sessions too: an old continued transcript is just as
+    removable. Running sessions are skipped, not refused, when they
+    only came in through a filter.
+    """
+    targets = sessions_from_refs(sessions, args.refs)
+    for session in targets:
+        ensure_idle(session, "remove")
+    if filters.selects:
+        targets += [s for s in select_sessions(sessions, filters)
+                    if not s.is_running]
+    if args.empty:
+        targets += [s for s in sessions
+                    if s.prompts == 0 and not s.is_running]
+    return list({session.id: session for session in targets}.values())
+
+
+def cmd_rm(args, sessions):
+    """Move sessions to the Trash after confirmation."""
+    filters = Filters.from_args(args, include_hidden=True)
+    if not args.refs and not args.empty and not filters.selects:
+        fail("which sessions? Give ids, titles, - for piped ids, "
+             "filters such as --older 30d, or --empty.")
+    targets = removal_targets(args, sessions, filters)
+    if not targets:
+        print("nothing to remove")
+        return
+    layout = table_layout()
+    for session in targets:
+        print(format_row(session, layout))
+    if not args.yes and not confirm(f"Move {len(targets)} to the Trash?"):
+        return
+    for session in targets:
+        trash_session(session)
+    print(f"moved {len(targets)} session(s) to {short_path(TRASH)}")
+
+
+# Commands: grep
+
+def snippet(text, needle, width=120):
+    """Return the text around the first occurrence of needle."""
+    index = text.lower().find(needle)
+    if index < 0:
+        return None
+    start = max(index - 40, 0)
+    return " ".join(text[start: start + width].split())
+
+
+def highlight(text, needle):
+    """Mark every occurrence of needle in text."""
+    pattern = re.compile(re.escape(needle), re.IGNORECASE)
+    return pattern.sub(lambda m: paint(m.group(0), "1;33"), text)
+
+
+def line_snippet(line, needle):
+    """Return a snippet from a user or assistant line, or None."""
+    record = parse_record(line)
+    if not record or record.get("type") not in ("user", "assistant"):
+        return None
+    return snippet(record_text(record), needle)
+
+
+def grep_session(session, needle, limit):
+    """Return up to limit snippets of needle in one transcript."""
+    hits = []
+    with open(session.path, errors="replace") as handle:
+        for line in handle:
+            if needle not in line.lower():
+                continue
+            found = line_snippet(line, needle)
+            if found:
+                hits.append(found)
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def cmd_grep(args, sessions):
+    """Search the message text of the selected transcripts."""
+    needle = " ".join(args.text).lower()
+    filters = Filters.from_args(args, include_hidden=True)
+    layout = table_layout()
+    matched = 0
+    for session in select_sessions(sessions, filters):
+        hits = grep_session(session, needle, args.max)
+        if not hits:
+            continue
+        matched += 1
+        print(format_row(session, layout))
+        for hit in hits:
+            print("    " + dim("\u2026") + highlight(hit, needle)
+                  + dim("\u2026"))
+    if not matched:
+        print(f"no session mentions {needle!r}", file=sys.stderr)
+
+
 # Audit: patterns
 
-# (kind, severity, regex). The first group, if any, is the secret part.
+# (category, severity, regex). Group 1, if present, is the secret.
 SECRET_PATTERNS = [
+    # The header alone is often just text about keys; a real key has
+    # a base64 body, with newlines possibly escaped as \n in the JSON
     ("private key", "high", re.compile(
-        r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
+        r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"
+        r"(?:\s|\\n|\\r)+[A-Za-z0-9+/=]{40}")),
     ("anthropic key", "high", re.compile(r"(sk-ant-[A-Za-z0-9_-]{20,})")),
     ("openai key", "high", re.compile(
         r"(sk-(?:proj-)?[A-Za-z0-9]{20,}[A-Za-z0-9_-]*)")),
@@ -667,13 +1407,15 @@ SECRET_PATTERNS = [
         r"([^\s\"'\\,;{}()<>\[\]]{8,})")),
 ]
 
+# Categories whose matches are often code or examples, not secrets
+PLACEHOLDER_CHECKED = ("password assignment", "url credentials")
 PLACEHOLDER_HINTS = ("xxx", "***", "...", "example", "changeme", "your",
                      "placeholder", "secret", "password", "redacted",
                      "dummy", "<", "$", "{", "%")
 RE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
 RE_SNAKE = re.compile(r"^[a-z_]+$|^[A-Z_]+$")
 
-# (category, severity, regex) checked against Bash commands
+# (category, severity, regex) for Bash commands; the first match counts
 COMMAND_PATTERNS = [
     ("pipe to shell", "high", re.compile(
         r"\b(?:curl|wget)\b[^|;&]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")),
@@ -701,11 +1443,9 @@ COMMAND_PATTERNS = [
 
 RE_HEREDOC = re.compile(
     r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.S)
-
 RE_SENSITIVE_PATH = re.compile(
     r"(?:/\.ssh/|/\.aws/|/\.gnupg/|/\.netrc|\.env(?:\.|$)|\.pem$|"
     r"\.kdbx$|id_(?:rsa|ed25519|ecdsa)|/\.config/gh/|credentials)")
-
 RE_OUTWARD_TOOL = re.compile(
     r"(?i)(?:send|reply|forward|publish|deploy|delete|trash|share|"
     r"execute|transition|create_event|update_event)")
@@ -713,8 +1453,7 @@ RE_OUTWARD_TOOL = re.compile(
 FILE_TOOLS = {"Read", "Edit", "Write", "NotebookEdit"}
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 SEVERITY_COLOR = {"high": "31", "medium": "33", "low": "2"}
-AUDIT_CACHE = os.path.join(HOME, ".cache", "claude-sessions-audit.json")
-AUDIT_VERSION = 5
+DETAIL_LIMIT = 160
 
 
 # Audit: secrets
@@ -732,31 +1471,30 @@ def looks_like_placeholder(value):
 def mask(value):
     """Return a masked form that still allows recognizing a secret."""
     if len(value) <= 8:
-        return value[:1] + "\u2026" + "({})".format(len(value))
-    return "{}\u2026{} ({})".format(value[:4], value[-2:], len(value))
+        return f"{value[:1]}\u2026({len(value)})"
+    return f"{value[:4]}\u2026{value[-2:]} ({len(value)})"
 
 
 def fingerprint(value):
-    """Return a short hash that identifies a secret without storing it."""
+    """Return a short hash that identifies a value without storing it."""
     return hashlib.sha256(value.encode()).hexdigest()[:12]
 
 
-def secret_finding(kind, severity, match):
+def secret_finding(category, severity, match):
     """Return a finding for one regex match, or None for noise."""
     value = match.group(1) if match.groups() else match.group(0)
-    checked = ("password assignment", "url credentials")
-    if kind in checked and looks_like_placeholder(value):
+    if category in PLACEHOLDER_CHECKED and looks_like_placeholder(value):
         return None
-    shown = value if kind == "private key" else mask(value)
-    return {"group": "secret", "category": kind, "severity": severity,
-            "detail": shown, "fp": fingerprint(value)}
+    shown = "BEGIN PRIVATE KEY" if category == "private key" \
+        else mask(value)
+    return Finding("secret", category, severity, shown, fingerprint(value))
 
 
 def scan_secrets(line):
     """Yield secret findings in one raw transcript line."""
-    for kind, severity, pattern in SECRET_PATTERNS:
+    for category, severity, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(line):
-            finding = secret_finding(kind, severity, match)
+            finding = secret_finding(category, severity, match)
             if finding:
                 yield finding
 
@@ -767,8 +1505,8 @@ def record_origin(record):
         return "assistant"
     content = (record.get("message") or {}).get("content")
     if isinstance(content, list) and any(
-            isinstance(b, dict) and b.get("type") == "tool_result"
-            for b in content):
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content):
         return "tool output"
     return "prompt" if record.get("type") == "user" else record.get("type")
 
@@ -787,9 +1525,9 @@ def tool_uses(record):
 
 def action_finding(category, severity, detail):
     """Return an action finding with a one line detail."""
-    detail = " ".join(str(detail).split())[:160]
-    return {"group": "action", "category": category, "severity": severity,
-            "detail": detail, "fp": fingerprint(category + detail)}
+    detail = " ".join(str(detail).split())[:DETAIL_LIMIT]
+    return Finding("action", category, severity, detail,
+                   fingerprint(category + detail))
 
 
 def strip_heredocs(command):
@@ -805,7 +1543,7 @@ def excerpt(text, match):
 
 
 def scan_command(command):
-    """Yield findings for one Bash command."""
+    """Yield the finding of one Bash command, if any."""
     executed = strip_heredocs(command)
     for category, severity, pattern in COMMAND_PATTERNS:
         match = pattern.search(executed)
@@ -818,10 +1556,10 @@ def scan_command(command):
 def scan_tool_use(name, tool_input):
     """Yield findings for one tool call."""
     if name == "Bash":
-        yield from scan_command(str(tool_input.get("command", "")))
+        command = str(tool_input.get("command", ""))
+        yield from scan_command(command)
         if tool_input.get("dangerouslyDisableSandbox"):
-            yield action_finding("sandbox disabled", "medium",
-                                 tool_input.get("command", ""))
+            yield action_finding("sandbox disabled", "medium", command)
     elif name in FILE_TOOLS:
         path = str(tool_input.get("file_path", ""))
         if RE_SENSITIVE_PATH.search(path):
@@ -845,13 +1583,16 @@ def is_scannable(line):
                                 '{"type":"file-history'))
 
 
-def audit_line(line, modes):
+def permission_mode(line):
+    """Return the mode of a permission-mode record, or None."""
+    if not line.startswith('{"type":"permission-mode"'):
+        return None
+    record = parse_record(line)
+    return record.get("permissionMode") if record else None
+
+
+def audit_line(line):
     """Return the findings of one raw transcript line."""
-    if line.startswith('{"type":"permission-mode"'):
-        record = parse_record(line)
-        if record and record.get("permissionMode"):
-            modes.add(record["permissionMode"])
-        return []
     findings = list(scan_secrets(line))
     is_action = '"tool_use"' in line and '"type":"assistant"' in line
     if not findings and not is_action:
@@ -860,21 +1601,18 @@ def audit_line(line, modes):
     if is_action:
         findings.extend(scan_actions(record))
     place = record_origin(record)
-    stamp = record.get("timestamp")
     for finding in findings:
-        finding.setdefault("where", place)
-        finding["time"] = stamp
+        finding.where = place
+        finding.time = record.get("timestamp")
     return findings
 
 
 def merge_finding(found, finding):
-    """Count repeated findings instead of listing them twice."""
-    key = (finding["group"], finding["category"], finding["fp"])
-    if key in found:
-        found[key]["count"] += 1
-        return
-    finding["count"] = 1
-    found[key] = finding
+    """Count a repeated finding instead of listing it twice."""
+    if finding.key in found:
+        found[finding.key].count += 1
+    else:
+        found[finding.key] = finding
 
 
 def audit_transcript(path):
@@ -885,7 +1623,11 @@ def audit_transcript(path):
         for line in handle:
             if not is_scannable(line):
                 continue
-            for finding in audit_line(line, modes):
+            mode = permission_mode(line)
+            if mode:
+                modes.add(mode)
+                continue
+            for finding in audit_line(line):
                 merge_finding(found, finding)
     if "bypassPermissions" in modes:
         merge_finding(found, action_finding(
@@ -893,418 +1635,314 @@ def audit_transcript(path):
     return list(found.values()), sorted(modes)
 
 
-def load_audit_cache():
-    """Return cached audit results keyed by transcript path."""
-    try:
-        with open(AUDIT_CACHE) as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return {}
-    if data.get("version") != AUDIT_VERSION:
-        return {}
-    return data.get("entries", {})
+def audit_data(path):
+    """Return the cacheable audit result of a transcript.
+
+    Top level and returning plain data, so a process pool can run it.
+    """
+    findings, modes = audit_transcript(path)
+    return {"findings": [dataclasses.asdict(f) for f in findings],
+            "modes": modes}
 
 
-def save_audit_cache(entries):
-    """Write the audit cache; it holds masked values only."""
-    write_private_json(AUDIT_CACHE, {"version": AUDIT_VERSION,
-                                     "entries": entries})
+def stale_transcripts(sessions, cache):
+    """Return (path, key) of transcripts without a fresh audit."""
+    stale = []
+    for session in sessions:
+        key = file_key(session.path)
+        if cache.get(session.path, key) is None:
+            stale.append((session.path, key))
+    return stale
 
 
-def cached_audit(session, cache):
-    """Return the audit result of a session, scanning if stale."""
-    key = file_key(session["path"])
-    entry = cache.get(session["path"])
-    if entry and entry.get("key") == key:
-        return entry["result"]
-    findings, modes = audit_transcript(session["path"])
-    result = {"findings": findings, "modes": modes}
-    cache[session["path"]] = {"key": key, "result": result}
-    return result
+def scan_results(paths):
+    """Yield audit data for paths, in parallel when there are many."""
+    if len(paths) < PARALLEL_THRESHOLD:
+        yield from map(audit_data, paths)
+        return
+    with concurrent.futures.ProcessPoolExecutor() as pool:
+        yield from pool.map(audit_data, paths)
 
 
-# Audit: rendering
+def refresh_audit_cache(sessions, cache):
+    """Scan every transcript whose audit result is missing or stale."""
+    stale = stale_transcripts(sessions, cache)
+    progress = Progress("scanning", len(stale))
+    results = scan_results([path for path, _ in stale])
+    for done, ((path, key), data) in enumerate(zip(stale, results), 1):
+        cache.put(path, key, data)
+        progress.update(done)
+    progress.finish()
 
-def wanted_finding(finding, args):
-    """Return True when a finding passes the audit filters."""
-    if args.only and finding["group"] != args.only:
+
+# Audit: report
+
+def wanted(finding, args):
+    """Return True when a finding passes --only and --min-severity."""
+    if args.only and finding.group != args.only:
         return False
-    rank = SEVERITY_ORDER[finding["severity"]]
+    rank = SEVERITY_ORDER[finding.severity]
     return rank <= SEVERITY_ORDER[args.min_severity]
 
 
-def finding_sort_key(finding):
+def finding_order(finding):
     """Order findings by severity, then group and category."""
-    return (SEVERITY_ORDER[finding["severity"]], finding["group"],
-            finding["category"])
+    return (SEVERITY_ORDER[finding.severity], finding.group,
+            finding.category)
 
 
 def format_finding(finding):
     """Return one indented report line for a finding."""
-    severity = finding["severity"]
-    count = "x{}".format(finding["count"]) if finding["count"] > 1 else ""
-    return "    {} {} {} {} {}".format(
-        paint(severity.ljust(6), SEVERITY_COLOR[severity]),
-        clip(finding["category"], 20),
-        paint(clip(finding.get("where") or "", 11), "2"),
+    count = f"x{finding.count}" if finding.count > 1 else ""
+    return "    " + " ".join([
+        paint(finding.severity.ljust(6), SEVERITY_COLOR[finding.severity]),
+        clip(finding.category, 20),
+        dim(clip(finding.where, 11)),
         count.rjust(4),
-        finding["detail"])
+        finding.detail,
+    ])
 
 
-def print_audit(session, result, findings):
+def print_session_audit(session, modes, findings, layout):
     """Print the report block of one session."""
-    print(format_row(session))
-    modes = ", ".join(result["modes"])
+    print(format_row(session, layout))
     if modes:
-        print("    " + paint("modes  " + modes, "2"))
+        print("    " + dim("modes  " + ", ".join(modes)))
     for finding in findings:
         print(format_finding(finding))
     print()
 
 
-def audit_session(session, args, cache):
-    """Audit one session and print it; return its shown findings."""
-    result = cached_audit(session, cache)
-    findings = sorted((f for f in result["findings"]
-                       if wanted_finding(f, args)), key=finding_sort_key)
-    if findings:
-        print_audit(session, result, findings[: args.max])
-    return findings
-
-
-def print_audit_summary(all_findings, session_count):
-    """Print totals per severity and distinct secrets."""
+def print_audit_summary(findings, session_count):
+    """Print totals per severity and the number of distinct secrets."""
     totals = {severity: 0 for severity in SEVERITY_ORDER}
-    for finding in all_findings:
-        totals[finding["severity"]] += 1
-    secrets = {f["fp"] for f in all_findings if f["group"] == "secret"}
-    print("{} sessions scanned: {} high, {} medium, {} low, "
-          "{} distinct secrets".format(session_count, totals["high"],
-                                       totals["medium"], totals["low"],
-                                       len(secrets)))
+    for finding in findings:
+        totals[finding.severity] += 1
+    secrets = {f.fp for f in findings if f.group == "secret"}
+    print(f"{session_count} sessions scanned: {totals['high']} high, "
+          f"{totals['medium']} medium, {totals['low']} low, "
+          f"{len(secrets)} distinct secrets")
 
 
-# Commands
+def session_findings(session, cache, args):
+    """Return (modes, wanted findings) of a session from the cache."""
+    data = cache.get(session.path, file_key(session.path)) or {}
+    findings = [Finding(**f) for f in data.get("findings", [])]
+    selected = sorted((f for f in findings if wanted(f, args)),
+                      key=finding_order)
+    return data.get("modes", []), selected
+
 
 def cmd_audit(args, sessions):
     """Scan transcripts for secrets and risky actions."""
-    args.all = True
-    selected = select_sessions(args, sessions)
-    cache = load_audit_cache()
-    all_findings = []
+    # Superseded and empty transcripts are on disk all the same
+    filters = Filters.from_args(args, include_hidden=True)
+    selected = select_sessions(sessions, filters)
+    cache = TranscriptCache(AUDIT_CACHE, AUDIT_VERSION)
+    refresh_audit_cache(selected, cache)
+    cache.save()
+    layout = table_layout()
+    shown = []
     for session in selected:
-        all_findings.extend(audit_session(session, args, cache))
-    cache = {p: cache[p] for p in cache if os.path.exists(p)}
-    save_audit_cache(cache)
-    print_audit_summary(all_findings, len(selected))
+        modes, findings = session_findings(session, cache, args)
+        if findings:
+            print_session_audit(session, modes, findings[: args.max],
+                                layout)
+        shown.extend(findings)
+    print_audit_summary(shown, len(selected))
 
 
-def review_directory(sessions, ref):
-    """Return the directory and label a review should run in."""
-    if os.path.isdir(ref):
-        path = os.path.abspath(ref)
-        return path, os.path.basename(path)
-    session = resolve(sessions, ref, newest=True)
-    return session["cwd"], session["title"] or session["id"][:8]
+# Command line
 
-
-def is_git_repo(path):
-    """Return True when path lies inside a git work tree."""
-    result = subprocess.run(
-        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
-        capture_output=True, text=True)
-    return result.returncode == 0
-
-
-def cmd_review(args, sessions):
-    """Start a new claude session running /security-review."""
-    path, label = review_directory(sessions, args.ref)
-    if not os.path.isdir(path):
-        fail("directory is gone: " + path)
-    if not is_git_repo(path):
-        fail("not a git repository: " + short_path(path))
-    os.chdir(path)
-    print("cd " + short_path(path), file=sys.stderr)
-    prompt = "/security-review"
-    if args.focus:
-        prompt += " " + " ".join(args.focus)
-    argv = ["claude", "-n", "security-review " + clip(label, 40).strip(),
-            prompt]
-    os.execvp(argv[0], argv)
-
-
-def cmd_list(args, sessions):
-    """Print the session table."""
-    if sys.stdout.isatty():
-        print(header_row())
-    for session in select_sessions(args, sessions):
-        print(format_row(session))
-
-
-def cmd_show(args, sessions):
-    """Print details of one session."""
-    show_session(resolve(sessions, args.ref, newest=True))
-
-
-def resume_argv(session, fork):
-    """Return the claude command line that reopens a session."""
-    live = session["live"]
-    if live and live.get("kind") == "bg":
-        return ["claude", "attach", session["id"]]
-    argv = ["claude", "--resume", session["id"]]
-    if fork:
-        argv.append("--fork-session")
-    return argv
-
-
-def cmd_resume(args, sessions):
-    """Change into the session directory and exec claude."""
-    session = resolve(sessions, args.ref, newest=True)
-    live = session["live"]
-    if live and live.get("kind") != "bg" and not args.fork:
-        fail("session is open in another terminal ({}).\n"
-             "Use --fork to branch off a copy."
-             .format(live_status_detail(session)))
-    if not os.path.isdir(session["cwd"]):
-        fail("directory is gone: " + session["cwd"])
-    os.chdir(session["cwd"])
-    print("cd " + short_path(session["cwd"]), file=sys.stderr)
-    argv = resume_argv(session, args.fork)
-    os.execvp(argv[0], argv)
-
-
-def ensure_idle(session):
-    """Exit when a session is running and must not be touched."""
-    if session["live"]:
-        fail("session {} is running ({}), close it first"
-             .format(session["id"][:8], live_status_detail(session)))
-
-
-def cmd_rename(args, sessions):
-    """Append a custom-title record to a transcript."""
-    session = resolve(sessions, args.ref)
-    ensure_idle(session)
-    record = {"type": "custom-title", "customTitle": args.name,
-              "sessionId": session["id"]}
-    with open(session["path"], "a") as handle:
-        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
-    print("renamed {} to {!r}".format(session["id"][:8], args.name))
-
-
-def confirm(question):
-    """Ask a yes/no question on the terminal."""
-    try:
-        answer = input(question + " [y/N] ")
-    except EOFError:
-        return False
-    return answer.strip().lower() in ("y", "yes", "j", "ja")
-
-
-def trash_session(session):
-    """Move a transcript and its sidecar directory to the Trash."""
-    target = os.path.join(TRASH, os.path.basename(
-        os.path.dirname(session["path"])))
-    os.makedirs(target, exist_ok=True)
-    sidecar = session["path"][: -len(".jsonl")]
-    for path in (session["path"], sidecar):
-        if os.path.exists(path):
-            shutil.move(path, os.path.join(target, os.path.basename(path)))
-
-
-def cmd_rm(args, sessions):
-    """Move sessions to the Trash after confirmation."""
-    selected = [resolve(sessions, ref) for ref in args.refs]
-    for session in selected:
-        ensure_idle(session)
-        print(format_row(session))
-    if not args.yes and not confirm("Move to Trash?"):
-        return
-    for session in selected:
-        trash_session(session)
-    print("moved {} session(s) to {}".format(
-        len(selected), short_path(TRASH)))
-
-
-def line_snippet(line, needle):
-    """Return text around needle from a matching message line."""
-    record = parse_record(line)
-    if not record or record.get("type") not in ("user", "assistant"):
-        return None
-    text = message_text((record.get("message") or {}).get("content"))
-    index = text.lower().find(needle)
-    if index < 0:
-        return None
-    start = max(index - 50, 0)
-    return " ".join(text[start: index + len(needle) + 70].split())
-
-
-def grep_session(session, needle):
-    """Return up to three snippets of needle in one transcript."""
-    hits = []
-    with open(session["path"], errors="replace") as handle:
-        for line in handle:
-            if needle not in line.lower():
-                continue
-            snippet = line_snippet(line, needle)
-            if snippet:
-                hits.append(snippet)
-            if len(hits) >= 3:
-                break
-    return hits
-
-
-def cmd_grep(args, sessions):
-    """Search the message text of all transcripts."""
-    needle = " ".join(args.text).lower()
-    for session in sessions:
-        hits = grep_session(session, needle)
-        if not hits:
-            continue
-        print(format_row(session))
-        for hit in hits:
-            print("    " + paint("…" + hit + "…", "2"))
-
-
-def fzf_line(session):
-    """Return one picker line: id, tab, plain row text."""
-    return session["id"] + "\t" + format_row(session)
-
-
-def cmd_pick(args, sessions):
-    """Choose a session with fzf and resume it."""
-    if not shutil.which("fzf"):
-        fail("fzf is not installed")
-    selected = select_sessions(args, sessions)
-    os.environ["NO_COLOR"] = "1"
-    lines = "\n".join(fzf_line(s) for s in selected)
-    me = os.path.abspath(sys.argv[0])
-    result = subprocess.run(
-        ["fzf", "--delimiter", "\t", "--with-nth", "2",
-         "--no-sort", "--prompt", "session> ",
-         "--preview", "NO_COLOR=1 {} show {{1}}".format(me),
-         "--preview-window", "down,45%,wrap",
-         "--header", "Enter resume, ctrl-y copy id"],
-        input=lines, capture_output=False, stdout=subprocess.PIPE,
-        text=True)
-    choice = result.stdout.strip()
-    if not choice:
-        return
-    os.environ.pop("NO_COLOR", None)
-    args.ref = choice.split("\t", 1)[0]
-    args.fork = False
-    cmd_resume(args, sessions)
-
-
-# Argument parsing
-
-def filter_parser():
-    """Return a parent parser with the shared list filters."""
+def filter_options():
+    """Return a parent parser with the shared filter options."""
     parent = argparse.ArgumentParser(add_help=False)
-    parent.add_argument("query", nargs="*")
-    parent.add_argument("-a", "--all", action="store_true",
-                        help="include empty and continued sessions")
-    parent.add_argument("-n", "--limit", type=int, default=0)
-    parent.add_argument("--here", action="store_true",
-                        help="only sessions in or below this directory")
-    named = parent.add_mutually_exclusive_group()
+    group = parent.add_argument_group("filters")
+    group.add_argument("-a", "--all", action="store_true",
+                       help="include empty and continued sessions")
+    group.add_argument("--dir", metavar="PATH",
+                       help="only sessions started exactly in PATH")
+    group.add_argument("--under", metavar="PATH",
+                       help="only sessions started in or below PATH")
+    group.add_argument("--here", action="store_true",
+                       help="same as --under with the current directory")
+    group.add_argument("--older", type=parse_duration, metavar="AGE",
+                       help="idle for at least AGE: 30m, 12h, 30d, 2w")
+    group.add_argument("--newer", type=parse_duration, metavar="AGE",
+                       help="active within the last AGE")
+    group.add_argument("--from", dest="ids_from", metavar="FILE",
+                       help="only session ids listed in FILE, - for stdin")
+    named = group.add_mutually_exclusive_group()
     named.add_argument("--named", dest="named", action="store_true",
                        default=None, help="only sessions you named")
     named.add_argument("--unnamed", dest="named", action="store_false",
-                       help="only sessions without a name")
-    source = parent.add_mutually_exclusive_group()
-    source.add_argument("--app", dest="origin", action="store_const",
+                       help="only sessions without a name of yours")
+    origin = group.add_mutually_exclusive_group()
+    origin.add_argument("--app", dest="origin", action="store_const",
                         const="app", help="started in the Claude app")
-    source.add_argument("--term", dest="origin", action="store_const",
+    origin.add_argument("--term", dest="origin", action="store_const",
                         const="term", help="started in a terminal")
-    parent.add_argument("-s", "--sort", choices=sorted(SORT_KEYS),
-                        default="active")
-    parent.add_argument("-R", "--reverse", action="store_true")
+    group.add_argument("-s", "--sort", choices=list(SORT_KEYS),
+                       default="active", help="sort key (default: active)")
+    group.add_argument("-R", "--reverse", action="store_true",
+                       help="reverse the sort order")
+    group.add_argument("-n", "--limit", type=int, default=0,
+                       metavar="N", help="show at most N sessions")
     return parent
 
 
-def build_parser():
-    """Return the argument parser with all subcommands."""
-    parser = argparse.ArgumentParser(
-        prog="claudes", description="Manage Claude Code sessions.")
-    parser.add_argument("--version", action="version",
-                        version="%(prog)s " + __version__)
-    sub = parser.add_subparsers(dest="command")
-    filters = filter_parser()
+def query_argument(parser):
+    """Add the free text query that all terms must match."""
+    parser.add_argument("query", nargs="*",
+                        help="words to look for in title, directory, id,"
+                             " branch and prompts")
 
+
+def add_browse_commands(sub, filters):
+    """Add list, pick, show and resume."""
     listing = sub.add_parser("list", aliases=["ls"], parents=[filters],
-                             help="list sessions")
+                             help="list sessions (default command)")
+    query_argument(listing)
+    output = listing.add_mutually_exclusive_group()
+    output.add_argument("-q", "--ids", action="store_true",
+                        help="print only session ids, for pipes")
+    output.add_argument("--format", metavar="TEMPLATE",
+                        help="print each session as TEMPLATE, such as"
+                             " '{short_id} {directory}'")
+    output.add_argument("--json", action="store_true",
+                        help="print JSON instead of a table")
     listing.set_defaults(func=cmd_list)
 
     pick = sub.add_parser("pick", aliases=["p"], parents=[filters],
-                          help="fzf picker")
+                          help="choose a session with fzf and resume it")
+    query_argument(pick)
     pick.set_defaults(func=cmd_pick)
 
-    show = sub.add_parser("show", help="session details")
-    show.add_argument("ref")
+    show = sub.add_parser("show", help="details of sessions")
+    show.add_argument("refs", metavar="ID", nargs="+",
+                      help="- reads ids from stdin")
     show.set_defaults(func=cmd_show)
 
-    resume = sub.add_parser("resume", aliases=["r"], help="resume")
-    resume.add_argument("ref")
+    resume = sub.add_parser("resume", aliases=["r"],
+                            help="resume a session in its directory")
+    resume.add_argument("ref", metavar="ID", nargs="?",
+                        help="omit to pick one with fzf")
     resume.add_argument("--fork", action="store_true",
                         help="branch off into a new session id")
     resume.set_defaults(func=cmd_resume)
 
+
+def add_manage_commands(sub, filters):
+    """Add rename, rm and grep."""
     rename = sub.add_parser("rename", help="set the session title")
-    rename.add_argument("ref")
+    rename.add_argument("ref", metavar="ID")
     rename.add_argument("name")
     rename.set_defaults(func=cmd_rename)
 
-    remove = sub.add_parser("rm", help="move sessions to Trash")
-    remove.add_argument("refs", nargs="+")
-    remove.add_argument("-y", "--yes", action="store_true")
+    remove = sub.add_parser("rm", parents=[filters],
+                            help="move sessions to the Trash")
+    remove.add_argument("refs", metavar="ID", nargs="*",
+                        help="- reads ids from stdin")
+    remove.add_argument("--empty", action="store_true",
+                        help="also every session without a prompt")
+    remove.add_argument("-y", "--yes", action="store_true",
+                        help="do not ask for confirmation")
     remove.set_defaults(func=cmd_rm)
 
-    grep = sub.add_parser("grep", help="full text search")
+    grep = sub.add_parser("grep", parents=[filters],
+                          help="search the text of all conversations")
     grep.add_argument("text", nargs="+")
+    grep.add_argument("--max", type=int, default=3, metavar="N",
+                      help="snippets per session (default: 3)")
     grep.set_defaults(func=cmd_grep)
 
+
+def add_security_commands(sub, filters):
+    """Add audit and review."""
     audit = sub.add_parser("audit", parents=[filters],
-                           help="secrets and risky actions")
+                           help="find secrets and risky actions")
+    query_argument(audit)
     audit.add_argument("--only", choices=["secret", "action"])
-    audit.add_argument("--min-severity", choices=sorted(SEVERITY_ORDER),
-                       default="medium")
-    audit.add_argument("--max", type=int, default=15,
-                       help="findings shown per session")
+    audit.add_argument("--min-severity", choices=list(SEVERITY_ORDER),
+                       default="medium",
+                       help="lowest severity shown (default: medium)")
+    audit.add_argument("--max", type=int, default=15, metavar="N",
+                       help="findings shown per session (default: 15)")
     audit.set_defaults(func=cmd_audit)
 
-    review = sub.add_parser("review", help="run /security-review")
-    review.add_argument("ref", help="session id, title or directory")
+    review = sub.add_parser("review",
+                            help="run /security-review in a repository")
+    review.add_argument("ref", metavar="ID|DIR",
+                        help="session id, title or directory")
     review.add_argument("focus", nargs="*",
                         help="extra instructions for the review")
     review.set_defaults(func=cmd_review)
-    return parser
 
 
-# claude -r / --resume habits: "claudes -r ID" resumes like "claude -r ID"
+EXAMPLES = """\
+examples:
+  claudes                      sessions, most recently active first
+  claudes api --term           terminal sessions matching "api"
+  claudes --unnamed -s msgs    unnamed sessions, longest first
+  claudes -r api-refactor      resume in its own directory
+  claudes pick                 fuzzy finder, Enter resumes
+  claudes audit                secrets and risky actions
+
+selecting many sessions:
+  claudes --unnamed --dir ~ --older 30d       what would match
+  claudes rm --unnamed --dir ~ --older 30d    move them to the Trash
+  claudes --older 60d -q | claudes rm -       the same through a pipe
+  claudes --app -q | claudes audit --from -   audit only those
+"""
+
+
+def build_parser():
+    """Return the parser and the names that select a subcommand."""
+    parser = argparse.ArgumentParser(
+        prog="claudes", epilog=EXAMPLES,
+        description="List, find, resume and audit Claude Code sessions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s " + __version__)
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    filters = filter_options()
+    add_browse_commands(sub, filters)
+    add_manage_commands(sub, filters)
+    add_security_commands(sub, filters)
+    return parser, set(sub.choices) | {"-h", "--help", "--version"}
+
+
+# "claudes -r ID" resumes, the habit from "claude -r ID"
 RESUME_FLAGS = {"-r", "--resume"}
 
-COMMANDS = {"list", "ls", "pick", "p", "show", "resume", "r", "rename",
-            "rm", "grep", "audit", "review", "-h", "--help",
-            "--version"}
 
-
-def main():
-    """Entry point: bare queries default to the list command."""
-    argv = sys.argv[1:]
+def normalize_argv(argv, commands):
+    """Map -r to resume and make list the default command."""
     if argv and argv[0] in RESUME_FLAGS:
-        argv = ["resume"] + argv[1:]
-    elif not argv or argv[0] not in COMMANDS:
-        argv = ["list"] + argv
-    args = build_parser().parse_args(argv)
+        return ["resume"] + argv[1:]
+    if not argv or argv[0] not in commands:
+        return ["list"] + argv
+    return argv
+
+
+def main(argv=None):
+    """Parse the command line and run the command."""
+    parser, commands = build_parser()
+    argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(normalize_argv(argv, commands))
     args.func(args, load_sessions())
 
 
 def run():
-    """Console entry point: exit quietly on a closed pipe or ctrl-c."""
+    """Console entry point: quiet on ctrl-c and on a closed pipe."""
     try:
         main()
-    except (BrokenPipeError, KeyboardInterrupt):
+    except KeyboardInterrupt:
         sys.exit(130)
+    except BrokenPipeError:
+        # Python would complain again when flushing stdout at exit
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
 
 
 if __name__ == "__main__":

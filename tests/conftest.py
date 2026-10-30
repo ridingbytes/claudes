@@ -87,5 +87,5 @@ def make_session(claude_home):
 
 
 def make_id(number):
-    """Return a valid session uuid ending in number."""
-    return "00000000-0000-0000-0000-{:012d}".format(number)
+    """Return a valid session uuid whose short id shows number."""
+    return "{:08d}-0000-0000-0000-000000000000".format(number)

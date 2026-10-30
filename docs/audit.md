@@ -18,6 +18,7 @@ claudes audit --only action          # only actions
 claudes audit --min-severity low     # include low findings
 claudes audit --min-severity high    # only the critical ones
 claudes audit --max 50               # findings per session (default 15)
+claudes --app -q | claudes audit --from -   # only piped sessions
 ```
 
 Output per session: the list row, the permission modes the
@@ -43,7 +44,7 @@ secret in a superseded transcript is still on disk.
 
 | Category | Severity | Pattern |
 |---|---|---|
-| private key         | high   | `-----BEGIN ... PRIVATE KEY-----` |
+| private key         | high   | `-----BEGIN ... PRIVATE KEY-----` followed by a key body |
 | anthropic key       | high   | `sk-ant-...` |
 | openai key          | high   | `sk-...`, `sk-proj-...` |
 | aws key             | high   | `AKIA...`, `ASIA...` |
@@ -116,8 +117,8 @@ repeated (`x4`).
 
 ### Speed and cache
 
-The first audit reads every transcript and takes roughly a
-minute per gigabyte. Results are cached per transcript in
+The first audit reads every transcript, in parallel on all
+cores, and takes roughly 20 seconds per gigabyte on a laptop. Results are cached per transcript in
 `~/.cache/claude-sessions-audit.json`, keyed by modification
 time and size, so later runs only rescan changed sessions. The
 cache holds masked values and short SHA-256 fingerprints, never
