@@ -63,7 +63,7 @@ already writes under `~/.claude` and sends nothing anywhere.
 
 ## Install
 
-Python 3.9 or newer, no dependencies. `fzf` is optional and only
+Python 3.10 or newer, no dependencies. `fzf` is optional and only
 needed for `claudes pick`.
 
 ```sh

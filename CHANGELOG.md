@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Write both caches with mode 0600 from the start. The metadata
+  cache holds the first and last prompt of every session and was
+  created world readable under the default umask.
+- Require Python 3.10; 3.9 is end of life and no longer
+  available on the CI runners.
+
 ## 0.1.0
 
 First public release.

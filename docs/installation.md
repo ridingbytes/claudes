@@ -1,7 +1,7 @@
 # Installation
 
 `claudes` is a single Python file without dependencies. It needs
-Python 3.9 or newer and runs on macOS and Linux. `fzf` is
+Python 3.10 or newer and runs on macOS and Linux. `fzf` is
 optional and only used by `claudes pick`.
 
 ## pipx
