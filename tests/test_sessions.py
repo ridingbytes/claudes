@@ -171,3 +171,10 @@ def test_cache_is_reused_until_the_file_changes(make_session):
         handle.write(json.dumps(user_line("y"), separators=(",", ":"))
                      + "\n")
     assert claudes.load_sessions()[0]["prompts"] == 2
+
+
+def test_caches_are_owner_only(make_session, claude_home):
+    make_session(make_id(1), [user_line("private prompt")])
+    claudes.load_sessions()
+    mode = os.stat(claude_home / "cache.json").st_mode & 0o777
+    assert mode == 0o600

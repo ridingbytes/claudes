@@ -40,7 +40,7 @@ import shutil
 import subprocess
 import sys
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.path.join(HOME, ".claude")
@@ -306,13 +306,25 @@ def load_cache():
     return data.get("entries", {})
 
 
+def write_private_json(path, data):
+    """Write JSON atomically, readable by the owner only.
+
+    The caches hold prompt text and masked findings, so they are
+    created with mode 0600 instead of following the umask.
+    """
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temp = path + ".tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    with os.fdopen(os.open(temp, flags, 0o600), "w") as handle:
+        json.dump(data, handle)
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+
+
 def save_cache(entries):
-    """Write the metadata cache atomically."""
-    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    temp = CACHE + ".tmp"
-    with open(temp, "w") as handle:
-        json.dump({"version": CACHE_VERSION, "entries": entries}, handle)
-    os.replace(temp, CACHE)
+    """Write the metadata cache."""
+    write_private_json(CACHE, {"version": CACHE_VERSION,
+                               "entries": entries})
 
 
 def file_key(path):
@@ -894,12 +906,8 @@ def load_audit_cache():
 
 def save_audit_cache(entries):
     """Write the audit cache; it holds masked values only."""
-    os.makedirs(os.path.dirname(AUDIT_CACHE), exist_ok=True)
-    temp = AUDIT_CACHE + ".tmp"
-    with open(temp, "w") as handle:
-        json.dump({"version": AUDIT_VERSION, "entries": entries}, handle)
-    os.chmod(temp, 0o600)
-    os.replace(temp, AUDIT_CACHE)
+    write_private_json(AUDIT_CACHE, {"version": AUDIT_VERSION,
+                                     "entries": entries})
 
 
 def cached_audit(session, cache):

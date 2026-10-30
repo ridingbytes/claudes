@@ -10,7 +10,7 @@
 
 It writes:
 
-- `~/.cache/claude-sessions.json`
+- `~/.cache/claude-sessions.json` (mode `0600`)
 - `~/.cache/claude-sessions-audit.json` (mode `0600`)
 - a `custom-title` record into a transcript on `rename`
 - `~/.Trash/claude-sessions/` on `rm`
