@@ -65,3 +65,11 @@ The transcript format is internal to Claude Code and changes
 now and then. Please open an issue with the Claude Code version
 (`claude --version`) and, if you can, a redacted sample line of
 the record type that changed.
+
+## Memories are gone after renaming a directory
+
+Claude Code files memories by the path of the project directory,
+so after a rename the new path starts without them. `claudes
+memory --gone` lists the orphaned ones, and `claudes memory mv
+--dir OLD --to NEW` moves them to the new path. See
+[memory.md](memory.md#mv).

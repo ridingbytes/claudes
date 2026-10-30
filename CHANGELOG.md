@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- `memory mv`: move memories to another project directory, one by
+  one or with `--dir OLD` every memory of a renamed directory and
+  its subprojects. Index lines move along; an identical copy in
+  the target replaces the moved one; a different file of the same
+  name stops the move.
+- `memory --gone`: only memories whose project directory is gone.
+
 ## 0.3.0
 
 - `claudes memory`: list the auto memories of every project with

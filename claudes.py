@@ -42,7 +42,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.path.join(HOME, ".claude")
@@ -828,10 +828,14 @@ def matches_query(session, terms):
     return all(term.lower() in text for term in terms)
 
 
+def in_tree(path, root):
+    """Return True when path is root or lies below it."""
+    return path == root or path.startswith(root + os.sep)
+
+
 def in_directory(session, directory):
     """Return True when the session ran in or below directory."""
-    cwd = session.cwd or ""
-    return cwd == directory or cwd.startswith(directory + os.sep)
+    return in_tree(session.cwd or "", directory)
 
 
 def idle_seconds(session):
@@ -1944,8 +1948,8 @@ def select_memories(memories, args):
     under = os.getcwd() if args.here else full_path(args.under)
     return [m for m in memories
             if (not args.type or m.type == args.type)
-            and (under is None or m.project == under
-                 or m.project.startswith(under + os.sep))
+            and (under is None or in_tree(m.project, under))
+            and (not args.gone or project_gone(m))
             and memory_matches(m, args.query)]
 
 
@@ -1978,11 +1982,16 @@ def resolve_memory(memories, ref):
     sys.exit(1)
 
 
+def project_gone(memory):
+    """Return True when the project directory of a memory is gone."""
+    return memory.loaded and not os.path.isdir(memory.project)
+
+
 def memory_flags(memory):
     """Return markers for memories that are unused or orphaned."""
     if not memory.loaded:
         return paint("not loaded", "31")
-    if not os.path.isdir(memory.project):
+    if project_gone(memory):
         return paint("project gone", "31")
     if not memory.indexed:
         return paint("not in index", "33")
@@ -2145,6 +2154,119 @@ def cmd_memory_rm(args, memories):
     print(f"moved {len(chosen)} memory file(s) to {short_path(TRASH)}")
 
 
+def project_memory_dir(project):
+    """Return the memory directory Claude Code reads for a project."""
+    return os.path.join(PROJECTS, slugify(project), "memory")
+
+
+def moved_project(memory, source, target):
+    """Return the project of a memory after moving source to target.
+
+    Without a source, the memory moves into target itself. With one,
+    the part below source is kept, so subprojects stay apart.
+    """
+    if source is None:
+        return target
+    return target + memory.project[len(source):]
+
+
+def index_line(memory):
+    """Return the line linking a memory from its MEMORY.md, or ""."""
+    index = os.path.join(os.path.dirname(memory.path), MEMORY_INDEX)
+    link = f"({os.path.basename(memory.path)})"
+    for line in read_text(index).splitlines():
+        if link in line:
+            return line
+    return ""
+
+
+def add_index_line(directory, line):
+    """Append a line to the MEMORY.md in directory, once."""
+    index = os.path.join(directory, MEMORY_INDEX)
+    text = read_text(index)
+    if not line or line in text.splitlines():
+        return
+    with open(index, "a") as handle:
+        handle.write(("\n" if text and not text.endswith("\n") else "")
+                     + line + "\n")
+
+
+def same_content(path, other):
+    """Return True when both files exist with the same text."""
+    return os.path.isfile(other) and read_text(path) == read_text(other)
+
+
+def move_memory(memory, directory):
+    """Move a memory file and its index line into directory.
+
+    A file with the same name and text already there makes the
+    moved copy redundant; it goes to the Trash instead.
+    """
+    line = index_line(memory)
+    target = os.path.join(directory, os.path.basename(memory.path))
+    os.makedirs(directory, exist_ok=True)
+    if same_content(memory.path, target):
+        trash_memory(memory)
+    else:
+        shutil.move(memory.path, target)
+        remove_index_line(memory)
+    add_index_line(directory, line)
+
+
+def memories_to_move(args, memories):
+    """Return the memories named by refs, or all of a directory."""
+    if not args.dir:
+        return [resolve_memory(memories, ref) for ref in args.refs]
+    if args.refs:
+        fail("give either memories or --dir, not both")
+    source = full_path(args.dir)
+    chosen = [m for m in memories
+              if m.loaded and in_tree(m.project, source)]
+    if not chosen:
+        fail(f"no memories in or below {short_path(source)}")
+    return chosen
+
+
+def move_plan(memory, source, target):
+    """Return (memory, new project, conflict) for one memory."""
+    project = moved_project(memory, source, target)
+    path = os.path.join(project_memory_dir(project),
+                        os.path.basename(memory.path))
+    exists = os.path.exists(path)
+    return memory, project, exists and not same_content(memory.path, path)
+
+
+def print_move(memory, project, conflict):
+    """Print one line of the move preview."""
+    note = paint("  differs from the file there", "31") if conflict else ""
+    print(paint(memory.label, "36") + dim("  ->  ")
+          + short_path(project) + note)
+
+
+def cmd_memory_mv(args, memories):
+    """Move memories to another project, for renamed directories."""
+    target = full_path(args.to)
+    if not os.path.isdir(target):
+        fail(f"{short_path(target)} is not a directory")
+    source = full_path(args.dir) if args.dir else None
+    plans = [move_plan(m, source, target)
+             for m in memories_to_move(args, memories)]
+    plans = [p for p in plans if p[0].project != p[1]]
+    if not plans:
+        fail("nothing to move")
+    for plan in plans:
+        print_move(*plan)
+    conflicts = [p for p in plans if p[2]]
+    if conflicts:
+        fail(f"{len(conflicts)} file(s) exist with other text in the "
+             "target; merge or remove them first")
+    if not args.yes and not confirm(f"Move {len(plans)} memories?"):
+        return
+    for memory, project, _ in plans:
+        move_memory(memory, project_memory_dir(project))
+    print(f"moved {len(plans)} memory file(s)")
+
+
 def cmd_memory_edit(args, memories):
     """Open a memory in $EDITOR."""
     memory = resolve_memory(memories, args.ref)
@@ -2301,6 +2423,8 @@ def add_memory_commands(sub):
                          help="only projects in or below PATH")
     listing.add_argument("--here", action="store_true",
                          help="only this directory and below")
+    listing.add_argument("--gone", action="store_true",
+                         help="only projects whose directory is gone")
     listing.set_defaults(memory_func=cmd_memory_list)
 
     show = actions.add_parser("show", help="print one memory")
@@ -2327,6 +2451,17 @@ def add_memory_commands(sub):
     remove.add_argument("refs", metavar="MEMORY", nargs="+")
     remove.add_argument("-y", "--yes", action="store_true")
     remove.set_defaults(memory_func=cmd_memory_rm)
+
+    move = actions.add_parser(
+        "mv", help="move memories to another project directory")
+    move.add_argument("refs", metavar="MEMORY", nargs="*")
+    move.add_argument("--dir", metavar="OLD",
+                      help="every memory of OLD and below, keeping"
+                           " subdirectories")
+    move.add_argument("--to", metavar="DIR", required=True,
+                      help="the project directory to move them to")
+    move.add_argument("-y", "--yes", action="store_true")
+    move.set_defaults(memory_func=cmd_memory_mv)
 
     edit = actions.add_parser("edit", help="open a memory in $EDITOR")
     edit.add_argument("ref", metavar="MEMORY")

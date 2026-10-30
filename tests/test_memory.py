@@ -155,3 +155,86 @@ def test_grep(memories, capsys):
     out = run(capsys, ["memory", "grep", "commas"])
     assert out.count("feedback_no_dashes") == 2
     assert "Use commas" in out
+
+
+def memory_dir(claude_home, project):
+    """Return the memory directory of a project path."""
+    return claude_home / "projects" / claudes.slugify(str(project)) / "memory"
+
+
+@pytest.fixture
+def renamed(claude_home, make_session, tmp_path):
+    """Memories of a directory that was renamed, with a subproject.
+
+    The subproject still has a session, which tells its directory;
+    the folder name alone could also mean work/old-app.
+    """
+    old = tmp_path / "work" / "old"
+    new = tmp_path / "work" / "new"
+    (new / "app").mkdir(parents=True)
+    slug_app = claudes.slugify(str(old / "app"))
+    make_session(make_id(7), [user_line("x", cwd=str(old / "app"))],
+                 slug=slug_app)
+    write_memory(claude_home, claudes.slugify(str(old)), "project_plan",
+                 "---\nname: plan\ntype: project\n---\nthe plan\n")
+    write_memory(claude_home, slug_app, "feedback_tests",
+                 "---\nname: tests\n---\nrun tests\n")
+    claudes.decode_slug.cache_clear()
+    return {"old": old, "new": new}
+
+
+def test_list_gone(renamed, capsys):
+    out = run(capsys, ["memory", "--gone"])
+    assert "project_plan" in out and "feedback_tests" in out
+
+
+def test_mv_directory_keeps_subprojects(renamed, claude_home, capsys):
+    old, new = renamed["old"], renamed["new"]
+    run(capsys, ["memory", "mv", "-y", "--dir", str(old), "--to", str(new)])
+    target = memory_dir(claude_home, new)
+    assert (target / "project_plan.md").read_text().endswith("the plan\n")
+    assert "(project_plan.md)" in (target / "MEMORY.md").read_text()
+    assert (memory_dir(claude_home, new / "app") / "feedback_tests.md"
+            ).exists()
+    source = memory_dir(claude_home, old)
+    assert not (source / "project_plan.md").exists()
+    assert "project_plan" not in (source / "MEMORY.md").read_text()
+    assert run(capsys, ["memory", "--gone"]) == ""
+
+
+def test_mv_single_memory(memories, claude_home, capsys, tmp_path):
+    target = tmp_path / "work" / "other"
+    target.mkdir()
+    run(capsys, ["memory", "mv", "-y", "web/project_notes",
+                 "--to", str(target)])
+    moved = memory_dir(claude_home, target) / "project_notes.md"
+    assert moved.exists()
+    # It was not in the index before, so it is not linked now either.
+    assert not (moved.parent / "MEMORY.md").exists()
+
+
+def test_mv_drops_an_identical_copy(memories, claude_home, capsys):
+    run(capsys, ["memory", "mv", "-y", "web/feedback_no_dashes",
+                 "--to", str(memories["api"])])
+    index = memory_dir(claude_home, memories["api"]) / "MEMORY.md"
+    assert index.read_text().count("(feedback_no_dashes.md)") == 1
+    trashed = claude_home / "trash" / "memory" / memories["slug_web"]
+    assert (trashed / "feedback_no_dashes.md").exists()
+
+
+def test_mv_refuses_a_different_file_in_the_target(memories, claude_home,
+                                                   capsys):
+    write_memory(claude_home, claudes.slugify(str(memories["api"])),
+                 "project_notes", "---\nname: notes\n---\napi notes\n")
+    with pytest.raises(SystemExit):
+        run(capsys, ["memory", "mv", "-y", "web/project_notes",
+                     "--to", str(memories["api"])])
+    assert "differs" in capsys.readouterr().out
+    source = memory_dir(claude_home, memories["web"]) / "project_notes.md"
+    assert source.exists()
+
+
+def test_mv_needs_an_existing_target(renamed, capsys):
+    with pytest.raises(SystemExit):
+        run(capsys, ["memory", "mv", "-y", "--dir", str(renamed["old"]),
+                     "--to", str(renamed["old"])])
