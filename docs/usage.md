@@ -83,11 +83,11 @@ sessions are always listed.
 | `size`    | Transcript size, largest first |
 | `cost`    | Recorded API cost, highest first |
 
-`-r` reverses the order.
+`-R` (`--reverse`) reverses the order.
 
 ```sh
 claudes --unnamed -s msgs       # big unnamed sessions worth naming
-claudes --app -s started -r     # app sessions, oldest first
+claudes --app -s started -R     # app sessions, oldest first
 claudes -s cost -n 5            # the five most expensive sessions
 ```
 
@@ -120,6 +120,7 @@ first and last prompt.
 claudes resume api-refactor
 claudes r 71c4
 claudes r api-refactor --fork
+claudes -r 71c4                 # same, as with claude -r
 ```
 
 Changes into the session's directory and replaces itself with

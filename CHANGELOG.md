@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+- `claudes -r ID` and `claudes --resume ID` resume a session,
+  as `claude -r` does. Before, `-r` reversed the sort order of
+  the list and the id was taken as a search term, so the
+  command only printed the list.
+- Reversing the sort order is now `-R` (`--reverse`).
+
 ## 0.1.1
 
 - Write both caches with mode 0600 from the start. The metadata

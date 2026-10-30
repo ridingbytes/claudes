@@ -11,6 +11,7 @@ Usage:
   claudes pick [QUERY...] [FILTERS]     fzf picker, Enter resumes
   claudes show ID                       details of one session
   claudes resume ID [--fork]            resume in its directory
+  claudes -r ID                         same, as with claude -r
   claudes rename ID NAME                set the session title
   claudes rm ID...                      move sessions to Trash
   claudes grep TEXT                     full text search
@@ -24,7 +25,7 @@ Filters:
   --app, --term          started in the Claude app or in a terminal
   -s, --sort KEY         active (default), started, name, dir, msgs,
                          size, cost
-  -r, --reverse          reverse the sort order
+  -R, --reverse          reverse the sort order
   -n, --limit N          show at most N sessions
 
 ID is a session id prefix or (part of) a session title.
@@ -40,7 +41,7 @@ import shutil
 import subprocess
 import sys
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.path.join(HOME, ".claude")
@@ -1217,7 +1218,7 @@ def filter_parser():
                         const="term", help="started in a terminal")
     parent.add_argument("-s", "--sort", choices=sorted(SORT_KEYS),
                         default="active")
-    parent.add_argument("-r", "--reverse", action="store_true")
+    parent.add_argument("-R", "--reverse", action="store_true")
     return parent
 
 
@@ -1279,6 +1280,9 @@ def build_parser():
     return parser
 
 
+# claude -r / --resume habits: "claudes -r ID" resumes like "claude -r ID"
+RESUME_FLAGS = {"-r", "--resume"}
+
 COMMANDS = {"list", "ls", "pick", "p", "show", "resume", "r", "rename",
             "rm", "grep", "audit", "review", "-h", "--help",
             "--version"}
@@ -1287,7 +1291,9 @@ COMMANDS = {"list", "ls", "pick", "p", "show", "resume", "r", "rename",
 def main():
     """Entry point: bare queries default to the list command."""
     argv = sys.argv[1:]
-    if not argv or argv[0] not in COMMANDS:
+    if argv and argv[0] in RESUME_FLAGS:
+        argv = ["resume"] + argv[1:]
+    elif not argv or argv[0] not in COMMANDS:
         argv = ["list"] + argv
     args = build_parser().parse_args(argv)
     args.func(args, load_sessions())
