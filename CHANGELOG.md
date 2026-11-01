@@ -12,6 +12,11 @@
   and a bypass default mode, add default deny rules for keys,
   `.env` files, `sudo`, force push and `curl | sh`. Shows the
   plan, asks, backs up each file.
+- `claudes ui`: a read-only page on 127.0.0.1 with what to fix
+  first, secrets to rotate, risky actions per week, every
+  permission finding, the audit per session and the session
+  list. Requests need a random token in the path and a loopback
+  Host header; the page loads nothing from outside.
 
 ## 0.4.0
 

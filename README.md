@@ -72,6 +72,9 @@ a09d33b7        3d             term      Fix flaky upload test     ~/develop/api
   `Bash(python3:*)`, `Bash(ssh host *)`), whether deny rules and
   the sandbox are set, and which MCP servers are configured.
   `--fix` removes the open rules and adds default deny rules.
+- **Local page.** `claudes ui` shows posture, audit findings,
+  secrets to rotate and sessions on a page served from
+  127.0.0.1, behind a random token. It only reads.
 
 Everything runs locally. `claudes` reads the files Claude Code
 already writes under `~/.claude` and sends nothing anywhere.
@@ -110,6 +113,7 @@ claudes rename 71c4 "release 2.4"
 claudes grep "connection pool"
 claudes audit                 # secrets and risky actions
 claudes posture --explain     # what Claude may do without asking
+claudes ui                    # posture, findings, sessions in the browser
 claudes review api-refactor   # /security-review in that repo
 
 # clean up: unnamed sessions started in ~, idle for a month
