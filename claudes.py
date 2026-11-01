@@ -45,6 +45,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import webbrowser
 from dataclasses import dataclass, field
@@ -603,13 +604,19 @@ def write_private_json(path, data):
     The caches hold prompt text and masked findings, so they are
     created with mode 0600 instead of following the umask.
     """
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    temp = path + ".tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    with os.fdopen(os.open(temp, flags, 0o600), "w") as handle:
-        json.dump(data, handle)
-    os.chmod(temp, 0o600)
-    os.replace(temp, path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    # A temp file of its own per writer: two scans at once would
+    # otherwise move one shared temp file away from each other
+    fd, temp = tempfile.mkstemp(dir=directory, suffix=".tmp",
+                                prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle)
+        os.replace(temp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp)
 
 
 class TranscriptCache:
@@ -2336,9 +2343,12 @@ class UiData:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.scan_lock = threading.Lock()
 
     def sessions(self):
-        return load_sessions()
+        # The page asks for posture, audit and sessions at once
+        with self.scan_lock:
+            return load_sessions()
 
     def posture(self):
         findings, paths = posture_findings(self.sessions())
