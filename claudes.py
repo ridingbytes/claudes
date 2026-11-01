@@ -17,6 +17,7 @@ Usage:
   claudes audit [QUERY...] [FILTERS]    secrets and risky actions
   claudes review ID|DIR [FOCUS...]      start /security-review there
   claudes posture [--fix]               what Claude may do unasked
+  claudes ui                            the same on a local web page
   claudes memory [ACTION]               list, show, grep, dupes,
                                         promote, rm, edit memories
 
@@ -34,13 +35,18 @@ import dataclasses
 import datetime
 import functools
 import hashlib
+import hmac
+import http.server
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import webbrowser
 from dataclasses import dataclass, field
 
 __version__ = "0.4.0"
@@ -2261,6 +2267,739 @@ def cmd_posture(args, sessions):
     print_posture(findings, paths, args)
 
 
+# UI
+#
+# A page on 127.0.0.1 that shows posture, audit findings and sessions.
+# It only reads. Other pages in the browser and other users on the
+# machine must not get at the data, so every request needs the random
+# token in its path and a Host header naming the loopback address
+# (against DNS rebinding), and the page may load nothing from outside.
+
+UI_HOST = "127.0.0.1"
+
+# What an audit finding means, for the page and for --explain
+AUDIT_ADVICE = {
+    "secret":
+        "A secret in the transcript. If it was in tool output or a "
+        "prompt, the model has seen it: rotate it.",
+    "pipe to shell":
+        "A script from the network ran unseen. Check where it came "
+        "from.",
+    "force push": "Remote history was overwritten.",
+    "recursive delete": "A recursive delete on a broad path.",
+    "permissions bypassed":
+        "The session ran with every permission check off.",
+    "sudo": "A command ran as root.",
+    "sandbox disabled": "A command asked to run outside the sandbox.",
+    "keychain read": "A password was read from the keychain.",
+    "sensitive file read": "A key or credential file was read.",
+    "outward tool":
+        "An MCP tool that sends, deletes or publishes was called.",
+    "remote shell": "A command ran on another machine.",
+}
+
+
+def audit_advice(finding):
+    """Return what an audit finding means, or an empty string."""
+    if finding.group == "secret":
+        return AUDIT_ADVICE["secret"]
+    return AUDIT_ADVICE.get(finding.category, "")
+
+
+def session_brief(session):
+    """Return the few session fields the page shows next to findings."""
+    return {"id": session.id, "short_id": session.short_id,
+            "title": session.title, "directory": short_path(session.cwd),
+            "active": session.last,
+            "running": session.process.label if session.process else None}
+
+
+def audit_finding_json(finding):
+    """Return an audit finding as plain data with its meaning."""
+    data = finding_json(finding)
+    data["advice"] = audit_advice(finding)
+    return data
+
+
+def session_audit_json(session, cache):
+    """Return the audit result of one session for the page."""
+    data = cache.get(session.path, file_key(session.path)) or {}
+    findings = sorted((Finding(**f) for f in data.get("findings", [])),
+                      key=finding_order)
+    return {"session": session_brief(session),
+            "modes": data.get("modes", []),
+            "findings": [audit_finding_json(f) for f in findings]}
+
+
+class UiData:
+    """Loads what the page shows; one scan at a time."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def sessions(self):
+        return load_sessions()
+
+    def posture(self):
+        findings, paths = posture_findings(self.sessions())
+        return {"files": [short_path(p) for p in paths],
+                "findings": [finding_json(f) for f in findings]}
+
+    def audit(self):
+        with self.lock:
+            sessions = self.sessions()
+            cache = TranscriptCache(AUDIT_CACHE, AUDIT_VERSION)
+            refresh_audit_cache(sessions, cache)
+            cache.save()
+        results = [session_audit_json(s, cache) for s in sessions]
+        return [r for r in results if r["findings"] or r["modes"]]
+
+    def session_list(self):
+        visible = [s for s in self.sessions() if not s.is_hidden]
+        return [dict(session_json(s), directory=short_path(s.cwd),
+                     short_id=s.short_id) for s in visible]
+
+
+UI_ROUTES = {
+    "api/posture": UiData.posture,
+    "api/audit": UiData.audit,
+    "api/sessions": UiData.session_list,
+}
+
+
+def ui_headers(nonce):
+    """Return the headers that keep the page to itself."""
+    policy = ("default-src 'none'; connect-src 'self'; img-src 'self' "
+              f"data:; script-src 'nonce-{nonce}'; style-src "
+              f"'nonce-{nonce}'; base-uri 'none'; form-action 'none'; "
+              "frame-ancestors 'none'")
+    return {"Content-Security-Policy": policy,
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Cross-Origin-Resource-Policy": "same-origin"}
+
+
+def ui_route(path, token):
+    """Return the route of a request path, or None without the token."""
+    prefix = f"/{token}/"
+    candidate = path.split("?", 1)[0]
+    if not hmac.compare_digest(candidate[:len(prefix)].encode(),
+                               prefix.encode()):
+        return None
+    return candidate[len(prefix):]
+
+
+def ui_handler(token, port, data):
+    """Return a request handler class bound to one server."""
+    nonce = secrets.token_urlsafe(16)
+    hosts = {f"{UI_HOST}:{port}", f"localhost:{port}"}
+    page = UI_PAGE.replace("__NONCE__", nonce).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "claudes"
+        sys_version = ""
+
+        def send(self, status, body, content_type):
+            self.send_response(status)
+            for name, value in ui_headers(nonce).items():
+                self.send_header(name, value)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def refuse(self, status):
+            self.send(status, b"", "text/plain")
+
+        def do_GET(self):
+            if self.headers.get("Host") not in hosts:
+                return self.refuse(403)
+            route = ui_route(self.path, token)
+            if route is None:
+                return self.refuse(404)
+            if route == "":
+                return self.send(200, page, "text/html; charset=utf-8")
+            loader = UI_ROUTES.get(route)
+            if loader is None:
+                return self.refuse(404)
+            body = json.dumps(loader(data)).encode()
+            self.send(200, body, "application/json")
+
+        def log_message(self, *args):
+            pass
+
+    return Handler
+
+
+def cmd_ui(args, sessions):
+    """Serve the page on 127.0.0.1 until ctrl-c."""
+    token = secrets.token_urlsafe(24)
+    server = http.server.ThreadingHTTPServer((UI_HOST, args.port), None)
+    port = server.server_address[1]
+    server.RequestHandlerClass = ui_handler(token, port, UiData())
+    url = f"http://{UI_HOST}:{port}/{token}/"
+    print(f"claudes ui on {url}\nctrl-c stops it", flush=True)
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+# The page renders every value with textContent, never as HTML:
+# transcripts hold text from web pages, mails and tool output.
+UI_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claudes</title>
+<style nonce="__NONCE__">
+:root {
+  --surface: #ffffff; --surface-soft: #faf6ee; --surface-strong: #f2ece1;
+  --fg: #475258; --fg-soft: #5a666c; --fg-muted: #9c9d9e;
+  --border: #e6dfd0; --border-strong: #c8c4b8;
+  --accent: #a99977; --accent-hover: #8c7d59;
+  --high: #b5523b; --medium: #a99977; --low: #9c9d9e; --ok: #5b8a6e;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #14161a; --surface-soft: #1c1f24;
+    --surface-strong: #262a30; --fg: #ece9df; --fg-soft: #c4c1b7;
+    --fg-muted: #8a8780; --border: #2a2e34; --border-strong: #3a3e45;
+    --accent: #c8b993; --accent-hover: #d6c8a5; --high: #d9765e;
+    --medium: #c8b993; --low: #8a8780; --ok: #7fb08f;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--surface); color: var(--fg-soft);
+  font: 300 16px/1.5 "Nunito Sans", -apple-system, "Segoe UI",
+    Helvetica, Arial, sans-serif;
+}
+main, header .bar { max-width: 1160px; margin: 0 auto; padding: 0 24px; }
+header { border-bottom: 2px solid var(--accent); }
+header .bar {
+  display: flex; align-items: center; gap: 16px; padding-top: 20px;
+  padding-bottom: 16px; flex-wrap: wrap;
+}
+header h1 { margin: 0; font-size: 24px; font-weight: 600; color: var(--fg); }
+header p { margin: 0; color: var(--fg-muted); flex: 1; min-width: 200px; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button, .btn {
+  font: inherit; color: var(--fg); background: none; cursor: pointer;
+  border: 1px solid var(--border-strong); padding: 6px 14px;
+}
+nav button[aria-selected="true"] {
+  background: var(--accent); border-color: var(--accent);
+  color: var(--surface);
+}
+.btn:hover, nav button:hover { border-color: var(--accent-hover); }
+h2 {
+  font-size: 20px; font-weight: 600; color: var(--fg);
+  border-left: 3px solid var(--accent); padding-left: 10px;
+  margin: 40px 0 12px;
+}
+h3 { font-size: 16px; font-weight: 600; color: var(--fg); margin: 0; }
+.lead { margin: 0 0 16px; max-width: 72ch; }
+.stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+  border: 1px solid var(--border); margin-top: 24px;
+}
+.stat { padding: 16px 20px; border-left: 1px solid var(--border); }
+.stat:first-child { border-left: 0; }
+.stat .n { font-size: 32px; font-weight: 600; color: var(--fg); }
+.stat .n.bad { color: var(--high); }
+.stat .n.good { color: var(--ok); }
+.stat .l { color: var(--fg-muted); font-size: 14px; }
+.callout {
+  background: var(--surface-soft); border-left: 3px solid var(--accent);
+  padding: 14px 18px; margin: 16px 0;
+}
+.callout code { font-size: 15px; }
+code, .mono { font-family: var(--mono); font-size: 14px; }
+.item {
+  border-top: 1px solid var(--border); padding: 14px 0;
+  display: grid; grid-template-columns: 90px 1fr; gap: 4px 16px;
+}
+.item .why { color: var(--fg-soft); }
+.item .where { grid-column: 2; color: var(--fg-muted); }
+.item ul { margin: 6px 0 0; padding-left: 18px; }
+.badge {
+  display: inline-block; font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .06em; padding: 1px 8px;
+  border: 1px solid currentColor; height: fit-content; width: fit-content;
+}
+.badge.high { color: var(--high); }
+.badge.medium { color: var(--medium); }
+.badge.low { color: var(--low); }
+table { border-collapse: collapse; width: 100%; font-size: 15px; }
+th {
+  text-align: left; font-weight: 600; color: var(--fg);
+  background: var(--surface-strong); padding: 8px 10px;
+}
+td {
+  border-top: 1px solid var(--border); padding: 8px 10px;
+  vertical-align: top;
+}
+td.detail { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+td.muted, .muted { color: var(--fg-muted); }
+.tools {
+  display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 16px;
+  align-items: center;
+}
+.tools input, .tools select {
+  font: inherit; color: var(--fg); background: var(--surface);
+  border: 1px solid var(--border-strong); padding: 6px 10px;
+}
+.tools input { min-width: 260px; }
+.block { margin: 0 0 28px; }
+.block .head {
+  display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  padding: 8px 0;
+}
+.state { color: var(--fg-muted); padding: 24px 0; }
+.chart svg { width: 100%; height: auto; display: block; }
+.chart .axis { fill: var(--fg-muted); font-size: 11px; }
+.chart .grid { stroke: var(--border); }
+.legend { display: flex; gap: 16px; font-size: 14px; color: var(--fg-muted); }
+.legend span::before {
+  content: ""; display: inline-block; width: 10px; height: 10px;
+  margin-right: 6px; background: var(--c);
+}
+.lg-high { --c: var(--high); }
+.lg-medium { --c: var(--medium); }
+.dot { color: var(--ok); }
+[hidden] { display: none !important; }
+@media (max-width: 720px) {
+  .stats { grid-template-columns: 1fr 1fr; }
+  .stat:nth-child(3) { border-left: 0; }
+  .item { grid-template-columns: 1fr; }
+  .item .where { grid-column: 1; }
+  .tools input { min-width: 0; flex: 1; }
+  .wide { overflow-x: auto; }
+}
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <h1>claudes</h1>
+  <p>What Claude Code may do without asking, and what it did.</p>
+  <nav id="tabs">
+    <button data-view="overview" aria-selected="true">Overview</button>
+    <button data-view="permissions">Permissions</button>
+    <button data-view="transcripts">Transcripts</button>
+    <button data-view="sessions">Sessions</button>
+  </nav>
+  <button class="btn" id="rescan">Rescan</button>
+</div></header>
+<main>
+<section id="overview">
+  <div class="stats" id="stats"></div>
+  <h2>Fix first</h2>
+  <p class="lead">Settings that let Claude Code act without asking.
+  One open rule is enough: allow lists of all files that apply to a
+  session are merged.</p>
+  <div class="callout">The worst of these go away with
+  <code>claudes posture --fix</code>. It shows the change, asks, and
+  keeps a backup of every file. Turn the sandbox on by hand.</div>
+  <div id="fixfirst"><div class="state">Loading settings</div></div>
+  <h2>Secrets to rotate</h2>
+  <p class="lead">Keys and tokens that appeared in a prompt or in tool
+  output. The model has seen them, and the transcripts keep them on
+  disk.</p>
+  <div id="secrets"><div class="state">Scanning transcripts</div></div>
+  <h2>Risky actions per week</h2>
+  <div class="legend">
+    <span class="lg-high">high</span>
+    <span class="lg-medium">medium</span>
+  </div>
+  <div class="chart" id="chart"><div class="state">Scanning</div></div>
+</section>
+<section id="permissions" hidden>
+  <h2>Permissions</h2>
+  <p class="lead">Every rule and setting that widens what Claude Code may
+  do, by the file it comes from.</p>
+  <div class="tools">
+    <select id="p-sev">
+      <option value="low">all severities</option>
+      <option value="medium">medium and high</option>
+      <option value="high">high only</option>
+    </select>
+  </div>
+  <div id="p-list"><div class="state">Loading</div></div>
+  <p class="muted" id="p-files"></p>
+</section>
+<section id="transcripts" hidden>
+  <h2>Transcripts</h2>
+  <p class="lead">Secrets and risky actions found in the session
+  transcripts. Values are masked.</p>
+  <div class="tools">
+    <input id="t-q" type="search" placeholder="filter by text">
+    <select id="t-sev">
+      <option value="medium">medium and high</option>
+      <option value="high">high only</option>
+      <option value="low">all severities</option>
+    </select>
+    <select id="t-group">
+      <option value="">secrets and actions</option>
+      <option value="secret">secrets</option>
+      <option value="action">actions</option>
+    </select>
+  </div>
+  <div id="t-list"><div class="state">Scanning transcripts</div></div>
+</section>
+<section id="sessions" hidden>
+  <h2>Sessions</h2>
+  <div class="tools">
+    <input id="s-q" type="search" placeholder="filter by text">
+  </div>
+  <div class="wide" id="s-list"><div class="state">Loading</div></div>
+</section>
+</main>
+<script nonce="__NONCE__">
+"use strict";
+const RANK = {high: 0, medium: 1, low: 2};
+const base = location.pathname.replace(/[^/]*$/, "");
+const state = {posture: null, audit: null, sessions: null};
+
+function el(tag, props, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (key === "text") node.textContent = value;
+    else if (key === "cls") node.className = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child == null) continue;
+    node.append(child instanceof Node ? child : String(child));
+  }
+  return node;
+}
+
+function badge(severity) {
+  return el("span", {cls: "badge " + severity, text: severity});
+}
+
+function fill(id, ...nodes) {
+  document.getElementById(id).replaceChildren(...nodes.flat());
+}
+
+function emptyState(text) {
+  return el("div", {cls: "state", text: text});
+}
+
+function age(stamp) {
+  if (!stamp) return "";
+  const minutes = (Date.now() - Date.parse(stamp)) / 60000;
+  if (minutes < 60) return Math.round(minutes) + "m";
+  if (minutes < 1440) return Math.round(minutes / 60) + "h";
+  return Math.round(minutes / 1440) + "d";
+}
+
+function atLeast(finding, severity) {
+  return RANK[finding.severity] <= RANK[severity];
+}
+
+function groupBy(items, key) {
+  const groups = new Map();
+  for (const item of items) {
+    const name = key(item);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(item);
+  }
+  return groups;
+}
+
+async function load(name) {
+  const response = await fetch(base + "api/" + name);
+  if (!response.ok) throw new Error(name + ": " + response.status);
+  return response.json();
+}
+
+function auditFindings() {
+  return (state.audit || []).flatMap(
+    r => r.findings.map(f => Object.assign({session: r.session}, f)));
+}
+
+function distinctSecrets() {
+  const seen = new Map();
+  for (const f of auditFindings()) {
+    if (f.group !== "secret" || f.where === "assistant") continue;
+    if (!seen.has(f.detail + f.category)) seen.set(f.detail + f.category, f);
+  }
+  return [...seen.values()].sort((a, b) => RANK[a.severity] -
+                                          RANK[b.severity]);
+}
+
+function stat(value, label, judge) {
+  const cls = value === null ? "n" : "n " + (value ? judge : "good");
+  return el("div", {cls: "stat"},
+    el("div", {cls: cls, text: value === null ? "…" : value}),
+    el("div", {cls: "l", text: label}));
+}
+
+function renderStats() {
+  const posture = state.posture && state.posture.findings;
+  const open = posture ? posture.filter(f => f.severity === "high")
+    .length : null;
+  const actions = state.audit ? auditFindings().filter(
+    f => f.group === "action" && f.severity === "high").length : null;
+  const secrets = state.audit ? distinctSecrets().length : null;
+  const running = state.sessions ? state.sessions.filter(s => s.running)
+    .length : null;
+  fill("stats",
+    stat(open, "high risk permission settings", "bad"),
+    stat(secrets, "secrets seen by the model", "bad"),
+    stat(actions, "high risk actions in transcripts", "bad"),
+    stat(running, "sessions running now", "n"));
+}
+
+function renderFixFirst() {
+  const findings = state.posture.findings.filter(
+    f => f.severity !== "low");
+  if (!findings.length) {
+    fill("fixfirst", emptyState("Nothing open. Deny rules and sandbox "
+                                + "are set."));
+    return;
+  }
+  const groups = groupBy(findings, f => f.category);
+  const items = [...groups.entries()].map(([category, list]) => {
+    const files = groupBy(list, f => f.where);
+    return el("div", {cls: "item"},
+      badge(list[0].severity),
+      el("div", {},
+        el("h3", {text: category + " (" + list.length + ")"}),
+        el("div", {cls: "why", text: list[0].advice})),
+      el("div", {cls: "where"}, el("ul", {},
+        [...files.entries()].map(([file, rules]) => el("li", {},
+          el("span", {cls: "mono", text: file}), ": ",
+          el("span", {cls: "mono",
+                      text: rules.map(r => r.detail).join("  ")}))))));
+  });
+  fill("fixfirst", items);
+}
+
+function renderSecrets() {
+  const secrets = distinctSecrets();
+  if (!secrets.length) {
+    fill("secrets", emptyState("No secret in prompts or tool output."));
+    return;
+  }
+  const rows = secrets.map(f => el("tr", {},
+    el("td", {}, badge(f.severity)),
+    el("td", {text: f.category}),
+    el("td", {cls: "detail", text: f.detail}),
+    el("td", {cls: "muted", text: f.where}),
+    el("td", {cls: "muted"},
+      el("span", {cls: "mono", text: f.session.short_id}), " ",
+      f.session.title)));
+  fill("secrets", el("div", {cls: "wide"}, el("table", {},
+    el("tr", {}, ["", "kind", "masked value", "seen in", "session"]
+      .map(h => el("th", {text: h}))), rows)));
+}
+
+function weekStart(stamp) {
+  const day = new Date(stamp);
+  day.setUTCHours(0, 0, 0, 0);
+  day.setUTCDate(day.getUTCDate() - ((day.getUTCDay() + 6) % 7));
+  return day.getTime();
+}
+
+function renderChart() {
+  const weeks = 16;
+  const now = weekStart(new Date().toISOString());
+  const buckets = [];
+  for (let i = weeks - 1; i >= 0; i--) {
+    buckets.push({start: now - i * 7 * 86400000, high: 0, medium: 0});
+  }
+  for (const f of auditFindings()) {
+    if (f.group !== "action" || !f.time || f.severity === "low") continue;
+    const bucket = buckets.find(b => b.start === weekStart(f.time));
+    if (bucket) bucket[f.severity] += f.count;
+  }
+  const max = Math.max(1, ...buckets.map(b => b.high + b.medium));
+  const ns = "http://www.w3.org/2000/svg";
+  const W = 960, H = 200, pad = 28, bw = (W - pad) / weeks;
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H + 24}`);
+  const add = (tag, attrs) => {
+    const node = document.createElementNS(ns, tag);
+    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    svg.append(node);
+    return node;
+  };
+  add("line", {x1: pad, x2: W, y1: H, y2: H, class: "grid"});
+  add("text", {x: 0, y: 12, class: "axis"}).textContent = max;
+  buckets.forEach((b, i) => {
+    const x = pad + i * bw + 3;
+    let y = H;
+    for (const severity of ["medium", "high"]) {
+      const h = (b[severity] / max) * (H - 16);
+      if (!h) continue;
+      y -= h;
+      const bar = add("rect", {x: x, y: y, width: bw - 6, height: h});
+      bar.style.fill = `var(--${severity})`;
+      bar.append(document.createElementNS(ns, "title"));
+      bar.lastChild.textContent = `${b[severity]} ${severity}`;
+    }
+    if (i % 2 === 0) {
+      const label = new Date(b.start).toISOString().slice(5, 10);
+      add("text", {x: x, y: H + 18, class: "axis"}).textContent = label;
+    }
+  });
+  fill("chart", svg);
+}
+
+function renderPermissions() {
+  const severity = document.getElementById("p-sev").value;
+  const findings = state.posture.findings.filter(
+    f => atLeast(f, severity));
+  const files = groupBy(findings, f => f.where);
+  const blocks = [...files.entries()].map(([file, list]) =>
+    el("div", {cls: "block"},
+      el("div", {cls: "head"}, el("h3", {cls: "mono", text: file})),
+      el("div", {cls: "wide"}, el("table", {},
+        list.map(f => el("tr", {},
+          el("td", {}, badge(f.severity)),
+          el("td", {text: f.category}),
+          el("td", {cls: "detail", text: f.detail}),
+          el("td", {cls: "muted", text: f.advice})))))));
+  fill("p-list", blocks.length ? blocks : emptyState("Nothing found."));
+  document.getElementById("p-files").textContent =
+    "Settings files read: " + state.posture.files.join(", ");
+}
+
+function matchesText(texts, query) {
+  if (!query) return true;
+  const haystack = texts.join(" ").toLowerCase();
+  return query.toLowerCase().split(/\s+/).every(w => haystack.includes(w));
+}
+
+function renderTranscripts() {
+  const query = document.getElementById("t-q").value.trim();
+  const severity = document.getElementById("t-sev").value;
+  const group = document.getElementById("t-group").value;
+  const blocks = [];
+  for (const result of state.audit) {
+    const s = result.session;
+    const shown = result.findings.filter(f => atLeast(f, severity) &&
+      (!group || f.group === group) &&
+      matchesText([f.category, f.detail, s.title, s.directory], query));
+    if (!shown.length) continue;
+    blocks.push(el("div", {cls: "block"},
+      el("div", {cls: "head"},
+        el("span", {cls: "mono", text: s.short_id}),
+        el("h3", {text: s.title || "(untitled)"}),
+        el("span", {cls: "muted mono", text: s.directory}),
+        el("span", {cls: "muted", text: age(s.active) + " ago"}),
+        result.modes.length ? el("span", {cls: "muted",
+          text: "modes: " + result.modes.join(", ")}) : null),
+      el("div", {cls: "wide"}, el("table", {}, shown.map(f =>
+        el("tr", {title: f.advice},
+          el("td", {}, badge(f.severity)),
+          el("td", {text: f.category}),
+          el("td", {cls: "muted", text: f.where}),
+          el("td", {cls: "muted", text: f.count > 1 ? "x" + f.count : ""}),
+          el("td", {cls: "detail", text: f.detail})))))));
+  }
+  fill("t-list", blocks.length ? blocks : emptyState("Nothing found."));
+}
+
+function highCounts() {
+  const counts = new Map();
+  for (const result of state.audit || []) {
+    const n = result.findings.filter(f => f.severity === "high").length;
+    counts.set(result.session.id, n);
+  }
+  return counts;
+}
+
+function renderSessions() {
+  const query = document.getElementById("s-q").value.trim();
+  const counts = highCounts();
+  const rows = state.sessions.filter(s => matchesText(
+    [s.title, s.directory, s.id, s.branch || ""], query)).map(s =>
+    el("tr", {},
+      el("td", {cls: "mono", text: s.short_id}),
+      el("td", {text: s.title}),
+      el("td", {cls: "detail", text: s.directory}),
+      el("td", {cls: "muted", text: s.source}),
+      el("td", {cls: "muted", text: age(s.active)}),
+      el("td", {cls: "muted", text: s.prompts}),
+      el("td", {}, s.running ? el("span", {cls: "dot",
+                                           text: "● " + s.running})
+                             : ""),
+      el("td", {}, counts.get(s.id) ? badge("high") : "",
+         counts.get(s.id) ? " " + counts.get(s.id) : "")));
+  fill("s-list", el("table", {},
+    el("tr", {}, ["id", "title", "directory", "source", "active",
+                  "prompts", "status", "findings"]
+      .map(h => el("th", {text: h}))), rows));
+}
+
+function renderAll() {
+  renderStats();
+  if (state.posture) { renderFixFirst(); renderPermissions(); }
+  if (state.audit) { renderSecrets(); renderChart(); renderTranscripts(); }
+  if (state.sessions) renderSessions();
+}
+
+function fail(id, error) {
+  fill(id, emptyState("Could not load: " + error.message));
+}
+
+function refresh() {
+  load("posture").then(d => { state.posture = d; renderAll(); })
+    .catch(e => fail("fixfirst", e));
+  load("sessions").then(d => { state.sessions = d; renderAll(); })
+    .catch(e => fail("s-list", e));
+  load("audit").then(d => { state.audit = d; renderAll(); })
+    .catch(e => { fail("secrets", e); fail("t-list", e); });
+}
+
+function show(view) {
+  for (const button of document.querySelectorAll("#tabs button")) {
+    button.setAttribute("aria-selected", button.dataset.view === view);
+  }
+  for (const section of document.querySelectorAll("main > section")) {
+    section.hidden = section.id !== view;
+  }
+  try { localStorage.setItem("claudes-view", view); } catch (e) { }
+}
+
+document.getElementById("tabs").addEventListener("click", event => {
+  if (event.target.dataset.view) show(event.target.dataset.view);
+});
+document.getElementById("rescan").addEventListener("click", refresh);
+for (const id of ["p-sev"]) {
+  document.getElementById(id).addEventListener("input", () => {
+    if (state.posture) renderPermissions();
+  });
+}
+for (const id of ["t-q", "t-sev", "t-group"]) {
+  document.getElementById(id).addEventListener("input", () => {
+    if (state.audit) renderTranscripts();
+  });
+}
+document.getElementById("s-q").addEventListener("input", () => {
+  if (state.sessions) renderSessions();
+});
+try { show(localStorage.getItem("claudes-view") || "overview"); }
+catch (e) { show("overview"); }
+renderStats();
+refresh();
+</script>
+</body>
+</html>
+"""
+
+
 # Memory
 #
 # Claude Code keeps auto memories per project as Markdown files with a
@@ -2867,6 +3606,14 @@ def add_security_commands(sub, filters):
     posture.add_argument("-y", "--yes", action="store_true",
                          help="do not ask for confirmation")
     posture.set_defaults(func=cmd_posture, only=None)
+
+    ui = sub.add_parser("ui", help="open a local page with posture,"
+                                   " findings and sessions")
+    ui.add_argument("--port", type=int, default=0,
+                    help="port on 127.0.0.1 (default: a free one)")
+    ui.add_argument("--no-open", action="store_true",
+                    help="print the address, do not open a browser")
+    ui.set_defaults(func=cmd_ui)
 
 
 def add_memory_commands(sub):

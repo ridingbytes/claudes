@@ -23,6 +23,15 @@ It writes:
 - Claude Code settings files on `posture --fix`, after asking,
   each with the previous version kept as `<file>.claudes-bak`
 
+`claudes ui` listens on 127.0.0.1 only, on a free port unless
+`--port` is given. Every request needs the random token that is
+printed at start and changes on every run; a request whose Host
+header is not the loopback address is refused, which stops DNS
+rebinding. The page has a strict Content Security Policy, loads
+nothing from other hosts and only reads: no request changes a
+file. Other local users who can read the process list still see
+nothing of the token, since it is not on the command line.
+
 `resume` and `review` hand over to the `claude` binary with
 `exec`; from then on Claude Code's own behavior and settings
 apply.
