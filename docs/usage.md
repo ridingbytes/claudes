@@ -256,6 +256,10 @@ every call, so it takes a few seconds on large histories.
 
 See [audit.md](audit.md).
 
+## posture
+
+See [posture.md](posture.md).
+
 ## memory
 
 See [memory.md](memory.md).

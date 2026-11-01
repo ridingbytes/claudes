@@ -16,6 +16,7 @@ Usage:
   claudes grep TEXT [FILTERS]           full text search
   claudes audit [QUERY...] [FILTERS]    secrets and risky actions
   claudes review ID|DIR [FOCUS...]      start /security-review there
+  claudes posture [--fix]               what Claude may do unasked
   claudes memory [ACTION]               list, show, grep, dupes,
                                         promote, rm, edit memories
 
@@ -1814,6 +1815,452 @@ def cmd_audit(args, sessions):
     print_audit_summary(shown, len(selected))
 
 
+# Posture
+#
+# What Claude Code may do without asking, read from the settings
+# files. Allow lists merge across files; a single rule such as
+# Bash(python3:*) lets every command through, whatever else is set.
+
+USER_SETTINGS = os.path.join(CLAUDE, "settings.json")
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/"
+                    "managed-settings.json",
+                    "/etc/claude-code/managed-settings.json")
+PROJECT_SETTINGS = ("settings.json", "settings.local.json")
+
+# Programs that run code passed to them, so a wildcard allow rule for
+# them allows any command
+INTERPRETERS = (
+    r"python[\d.]*|node|deno|bun|bash|zsh|sh|fish|dash|ksh|perl|ruby|"
+    r"php|osascript|env|xargs|eval|exec|sudo|npx|bunx|uvx|pipx|"
+    r"emacs|n?vim?|nohup|time|watch|command|nice")
+# Programs that run commands through an option: find -exec, awk system()
+INDIRECT = r"find|awk|gawk|make|git|docker|kubectl"
+
+# (category, severity, regex) for allow rules; the first match counts
+ALLOW_PATTERNS = [
+    ("runs anything", "high", re.compile(r"^Bash(?:\(\*\))?$")),
+    ("runs anything", "high", re.compile(
+        r"^Bash\((?:env\s+(?:-\S+\s+|\w+=\S*\s+)*)?(?:\S*/)?"
+        rf"(?:{INTERPRETERS})(?:\s+(?:-c|-e|--eval|--batch))?"
+        r"(?::\*|\s\*)\)$")),
+    ("remote shell", "high", re.compile(
+        r"^Bash\((?:ssh|mosh|kubectl\s+exec|docker\s+exec)"
+        r"(?::\*|\s[^)]*\*)\)$")),
+    ("runs anything (indirect)", "medium", re.compile(
+        rf"^Bash\((?:{INDIRECT})(?::\*|\s\*)\)$")),
+    ("pushes code", "medium", re.compile(r"^Bash\(git\s+push(?::\*|\s\*)")),
+    ("installs software", "medium", re.compile(
+        r"^Bash\((?:brew|pip3?|npm|pnpm|yarn|gem|cargo|apt(?:-get)?|"
+        r"uv\s+pip)\s+(?:install|add)(?::\*|\s\*)")),
+    ("reads any file", "low", re.compile(
+        r"^Bash\((?:cat|head|tail|less|more|strings|xxd|od)(?::\*|\s\*)\)$")),
+    ("fetches any url", "medium", re.compile(
+        r"^WebFetch(?:\(domain:\*\))?$")),
+    ("network tool", "medium", re.compile(
+        r"^Bash\((?:curl|wget|nc|ncat|socat)(?::\*|\s\*)\)$")),
+    ("every mcp tool", "medium", re.compile(r"^mcp__[^_]+(?:__\*)?$")),
+]
+
+# Applied by posture --fix to ~/.claude/settings.json. Read deny rules
+# also cover cat, head, tail and the like in Bash, not scripts.
+DEFAULT_DENY = [
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.gnupg/**)",
+    "Read(~/.config/gh/**)",
+    "Read(~/.config/op/**)",
+    "Read(~/.netrc)",
+    "Read(~/**/.env)",
+    "Read(~/**/.env.*)",
+    "Read(~/**/*.pem)",
+    "Read(~/**/*.kdbx)",
+    "Bash(sudo *)",
+    "Bash(git push --force *)",
+    "Bash(git push -f *)",
+    "Bash(curl * | sh)",
+    "Bash(curl * | bash)",
+    "Bash(wget * | sh)",
+]
+
+# Categories posture --fix removes from allow lists
+FIX_REMOVES = ("runs anything", "remote shell")
+
+ADVICE = {
+    "runs anything":
+        "Every command can run without a question: the interpreter "
+        "or shell runs whatever it is given. All other rules lose "
+        "their effect. Remove the rule; approve such commands one by "
+        "one.",
+    "remote shell":
+        "Any command, including sudo, can run on that host or "
+        "container without a question. Allow only the exact commands "
+        "you need, such as Bash(ssh host uptime).",
+    "runs anything (indirect)":
+        "These programs run other commands (find -exec, awk "
+        "system(), git -c, make targets). Narrow the rule to the "
+        "subcommands you use.",
+    "pushes code":
+        "Commits reach the remote without a look from you. Keep "
+        "pushes behind a question.",
+    "installs software":
+        "Packages run install scripts with your rights. A typo or a "
+        "poisoned package is enough. Keep installs behind a question.",
+    "reads any file":
+        "Reads any file the shell can read. Deny rules for Read "
+        "cover this command, so add them for keys and .env files.",
+    "fetches any url":
+        "Any page can be fetched. Fetched text can carry instructions "
+        "(prompt injection) and URLs can carry data out.",
+    "network tool":
+        "curl and friends can send any file to any host. This is the "
+        "classic path for data to leave the machine.",
+    "every mcp tool":
+        "Every tool of the server runs without a question, including "
+        "the ones that send, delete or publish.",
+    "bypass mode":
+        "Sessions start with every check off, including protected "
+        "paths. Use this mode only in a container or VM.",
+    "auto mode":
+        "A classifier decides instead of you. It stops most risky "
+        "actions but it is not a policy you control.",
+    "no deny rules":
+        "Nothing is forbidden outright. Deny rules win over every "
+        "allow rule and mode; posture --fix adds a default set.",
+    "sandbox off":
+        "Commands run with your full rights on files and network. "
+        "The sandbox limits writes to the project and routes network "
+        "access through an allow list. Turn it on in settings.json "
+        "with \"sandbox\": {\"enabled\": true} and test your usual "
+        "commands; it is not switched on by --fix.",
+    "sandbox reads keys":
+        "The sandbox lets commands read ~/.ssh and other credentials "
+        "by default. Add them to sandbox.filesystem.denyRead.",
+    "mcp server":
+        "Each MCP server adds tools that act on another system. "
+        "Configure servers in the projects that need them, not for "
+        "every session. claude.ai connectors (mail, drive) do not "
+        "show up here; check them in the claude.ai settings.",
+    "project mcp auto":
+        "Every MCP server a repository declares in .mcp.json starts "
+        "without a question. A cloned repository can bring its own.",
+}
+
+
+def settings_files(directories):
+    """Return the settings files that exist, user and managed first."""
+    paths = list(MANAGED_SETTINGS) + [USER_SETTINGS]
+    for directory in directories:
+        for name in PROJECT_SETTINGS:
+            paths.append(os.path.join(directory, ".claude", name))
+    seen = []
+    for path in paths:
+        if path not in seen and os.path.isfile(path):
+            seen.append(path)
+    return seen
+
+
+def session_directories(sessions):
+    """Return the existing directories sessions were started in."""
+    found = {s.cwd for s in sessions if s.cwd}
+    return sorted(d for d in found if os.path.isdir(d))
+
+
+def posture_finding(category, severity, detail, path):
+    """Return a posture finding for one settings file."""
+    finding = Finding("posture", category, severity, detail,
+                      fingerprint(category + detail + path))
+    finding.where = short_path(path)
+    return finding
+
+
+def classify_allow(rule):
+    """Return (category, severity) of a risky allow rule, or None."""
+    for category, severity, pattern in ALLOW_PATTERNS:
+        if pattern.search(rule):
+            return category, severity
+    return None
+
+
+def permissions_of(settings):
+    """Return the permissions block of parsed settings, or {}."""
+    block = settings.get("permissions") if isinstance(settings, dict) \
+        else None
+    return block if isinstance(block, dict) else {}
+
+
+def rule_list(settings, key):
+    """Return one rule list of parsed settings as strings."""
+    rules = permissions_of(settings).get(key)
+    return [str(r) for r in rules] if isinstance(rules, list) else []
+
+
+def scan_allow_rules(settings, path):
+    """Yield findings for the risky allow rules of a settings file."""
+    for rule in rule_list(settings, "allow"):
+        found = classify_allow(rule)
+        if found:
+            yield posture_finding(found[0], found[1], rule, path)
+
+
+def applies_everywhere(path):
+    """Return True for the user and managed settings files."""
+    return path == USER_SETTINGS or path in MANAGED_SETTINGS
+
+
+def scan_mode(settings, path):
+    """Yield a finding when a file sets a permissive default mode."""
+    mode = permissions_of(settings).get("defaultMode")
+    if mode == "bypassPermissions" and applies_everywhere(path):
+        yield posture_finding("bypass mode", "high", mode, path)
+    elif mode == "bypassPermissions":
+        # Ignored in project and local files since Claude Code 2.1.257
+        yield posture_finding("bypass mode", "medium",
+                              mode + " (ignored here by Claude Code"
+                              " 2.1.257 and later)", path)
+    elif mode == "auto":
+        yield posture_finding("auto mode", "low", mode, path)
+    if isinstance(settings, dict) and settings.get(
+            "enableAllProjectMcpServers"):
+        yield posture_finding("project mcp auto", "medium",
+                              "enableAllProjectMcpServers", path)
+
+
+def scan_settings_file(path):
+    """Yield the findings of one settings file."""
+    settings = read_json(path) or {}
+    yield from scan_mode(settings, path)
+    yield from scan_allow_rules(settings, path)
+
+
+def sandbox_of(settings):
+    """Return the sandbox block of parsed settings, or {}."""
+    block = settings.get("sandbox") if isinstance(settings, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def denies_key_reads(sandbox):
+    """Return True when the sandbox denies reading ~/.ssh."""
+    filesystem = sandbox.get("filesystem") or {}
+    deny = filesystem.get("denyRead") or []
+    return any(".ssh" in str(entry) for entry in deny)
+
+
+def scan_user_defaults(paths):
+    """Yield findings for protections missing in every session.
+
+    Only user and managed settings apply everywhere, so project files
+    do not count here.
+    """
+    loaded = [read_json(p) or {} for p in paths if applies_everywhere(p)]
+    where = USER_SETTINGS
+    if not any(rule_list(settings, "deny") for settings in loaded):
+        yield posture_finding("no deny rules", "medium",
+                              "permissions.deny is empty", where)
+    sandboxes = [sandbox_of(s) for s in loaded if sandbox_of(s)]
+    enabled = [s for s in sandboxes if s.get("enabled")]
+    if not enabled:
+        yield posture_finding("sandbox off", "medium",
+                              "sandbox.enabled is not set", where)
+    elif not any(denies_key_reads(s) for s in enabled):
+        yield posture_finding("sandbox reads keys", "low",
+                              "sandbox.filesystem.denyRead lacks ~/.ssh",
+                              where)
+
+
+def mcp_server_detail(name, config):
+    """Return a one line description of a configured MCP server."""
+    if not isinstance(config, dict):
+        return name
+    target = config.get("url") or " ".join(
+        [str(config.get("command") or "")]
+        + [str(a) for a in config.get("args") or []])
+    return f"{name}: {short_path(target.strip()) or '?'}"
+
+
+def mcp_servers(claude_json):
+    """Yield (name, config, scope) of the MCP servers in ~/.claude.json."""
+    for name, config in (claude_json.get("mcpServers") or {}).items():
+        yield name, config, CLAUDE_JSON
+    for project, state in (claude_json.get("projects") or {}).items():
+        servers = state.get("mcpServers") if isinstance(state, dict) \
+            else None
+        for name, config in (servers or {}).items():
+            yield name, config, project
+
+
+def scan_mcp_servers():
+    """Yield one low finding per configured MCP server."""
+    data = read_json(CLAUDE_JSON)
+    if not isinstance(data, dict):
+        return
+    for name, config, scope in mcp_servers(data):
+        yield posture_finding("mcp server", "low",
+                              mcp_server_detail(name, config), scope)
+
+
+def posture_findings(sessions):
+    """Return every posture finding, most severe first."""
+    paths = settings_files(session_directories(sessions) + [HOME])
+    findings = []
+    for path in paths:
+        findings.extend(scan_settings_file(path))
+    findings.extend(scan_user_defaults(paths))
+    findings.extend(scan_mcp_servers())
+    return sorted(findings, key=finding_order), paths
+
+
+def finding_json(finding):
+    """Return a finding as plain data, with advice for posture."""
+    data = dataclasses.asdict(finding)
+    data.pop("fp")
+    if finding.group == "posture":
+        data["advice"] = ADVICE.get(finding.category, "")
+    return data
+
+
+def print_posture(findings, paths, args):
+    """Print the posture report grouped by settings file."""
+    print(dim("settings read:"))
+    for path in paths:
+        print("    " + short_path(path))
+    print()
+    shown = [f for f in findings if wanted(f, args)]
+    current = None
+    for finding in sorted(shown, key=lambda f: f.where):
+        if finding.where != current:
+            if current is not None:
+                print()
+            current = finding.where
+            print(current)
+        print(format_finding(dataclasses.replace(finding, where="")))
+        if args.explain:
+            print("           " + dim(ADVICE.get(finding.category, "")))
+    print()
+    print_posture_summary(shown, len(paths))
+
+
+def print_posture_summary(findings, file_count):
+    """Print totals per severity for the settings files read."""
+    totals = {severity: 0 for severity in SEVERITY_ORDER}
+    for finding in findings:
+        totals[finding.severity] += 1
+    print(f"{file_count} settings files read: {totals['high']} high, "
+          f"{totals['medium']} medium, {totals['low']} low")
+
+
+# Posture: fix
+
+def without_rules(settings, rules):
+    """Return settings with the given allow rules and bypass mode off."""
+    updated = json.loads(json.dumps(settings))
+    block = updated.setdefault("permissions", {})
+    if "allow" in block:
+        block["allow"] = [r for r in block["allow"] if r not in rules]
+    if block.get("defaultMode") == "bypassPermissions":
+        del block["defaultMode"]
+    return updated
+
+
+def with_default_deny(settings):
+    """Return settings with the default deny rules added."""
+    updated = json.loads(json.dumps(settings))
+    block = updated.setdefault("permissions", {})
+    deny = list(block.get("deny") or [])
+    deny += [rule for rule in DEFAULT_DENY if rule not in deny]
+    block["deny"] = deny
+    return updated
+
+
+def removable_rules(path):
+    """Return the allow rules of a file that --fix removes."""
+    settings = read_json(path) or {}
+    return [f.detail for f in scan_allow_rules(settings, path)
+            if f.category in FIX_REMOVES]
+
+
+def fix_plan(paths):
+    """Return {path: (old settings, new settings)} for posture --fix."""
+    plan = {}
+    for path in paths:
+        if path in MANAGED_SETTINGS:
+            continue
+        settings = read_json(path) or {}
+        updated = without_rules(settings, removable_rules(path))
+        if path == USER_SETTINGS:
+            updated = with_default_deny(updated)
+        if updated != settings:
+            plan[path] = (settings, updated)
+    if USER_SETTINGS not in paths:
+        plan[USER_SETTINGS] = ({}, with_default_deny({}))
+    return plan
+
+
+def rule_changes(old, new):
+    """Return (removed, added) rules between two settings."""
+    changes = ([], [])
+    for key in ("allow", "deny", "ask"):
+        before, after = rule_list(old, key), rule_list(new, key)
+        changes[0].extend(f"{key} {r}" for r in before if r not in after)
+        changes[1].extend(f"{key} {r}" for r in after if r not in before)
+    mode = permissions_of(old).get("defaultMode")
+    if mode != permissions_of(new).get("defaultMode"):
+        changes[0].append(f"defaultMode {mode}")
+    return changes
+
+
+def print_fix_plan(plan):
+    """Print the rules --fix removes and adds, per file."""
+    for path, (old, new) in plan.items():
+        removed, added = rule_changes(old, new)
+        print(short_path(path))
+        for rule in removed:
+            print("    " + paint("- " + rule, "31"))
+        for rule in added:
+            print("    " + paint("+ " + rule, "32"))
+        print()
+
+
+def write_settings(path, settings):
+    """Back up a settings file, then write the new settings."""
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".claudes-bak")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(settings, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def cmd_posture_fix(args, paths):
+    """Remove allow rules that open everything and add deny rules."""
+    plan = fix_plan(paths)
+    if not plan:
+        print("nothing to fix")
+        return
+    print_fix_plan(plan)
+    if not args.yes and not confirm("Apply these changes?"):
+        return
+    for path, (_, new) in plan.items():
+        write_settings(path, new)
+    print(f"changed {len(plan)} file(s); backups end in .claudes-bak. "
+          "Running sessions reload the settings.")
+
+
+def cmd_posture(args, sessions):
+    """Report what Claude Code may do without asking."""
+    findings, paths = posture_findings(sessions)
+    if args.fix:
+        cmd_posture_fix(args, paths)
+        return
+    if args.json:
+        json.dump({"files": [short_path(p) for p in paths],
+                   "findings": [finding_json(f) for f in findings]},
+                  sys.stdout, indent=2)
+        print()
+        return
+    print_posture(findings, paths, args)
+
+
 # Memory
 #
 # Claude Code keeps auto memories per project as Markdown files with a
@@ -2405,6 +2852,22 @@ def add_security_commands(sub, filters):
                         help="extra instructions for the review")
     review.set_defaults(func=cmd_review)
 
+    posture = sub.add_parser("posture",
+                             help="what Claude Code may do without asking")
+    posture.add_argument("--min-severity", choices=list(SEVERITY_ORDER),
+                         default="low",
+                         help="lowest severity shown (default: low)")
+    posture.add_argument("-e", "--explain", action="store_true",
+                         help="explain each finding")
+    posture.add_argument("--json", action="store_true",
+                         help="print JSON instead of a report")
+    posture.add_argument("--fix", action="store_true",
+                         help="remove allow rules that open everything"
+                              " and add default deny rules")
+    posture.add_argument("-y", "--yes", action="store_true",
+                         help="do not ask for confirmation")
+    posture.set_defaults(func=cmd_posture, only=None)
+
 
 def add_memory_commands(sub):
     """Add memory with its own subcommands; list is the default."""
@@ -2477,6 +2940,7 @@ examples:
   claudes -r api-refactor      resume in its own directory
   claudes pick                 fuzzy finder, Enter resumes
   claudes audit                secrets and risky actions
+  claudes posture --explain    what Claude may do without asking
 
 selecting many sessions:
   claudes --unnamed --dir ~ --older 30d       what would match

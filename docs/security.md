@@ -7,6 +7,8 @@
 - `~/.claude/projects/**/*.jsonl` (session transcripts)
 - `~/.claude/sessions/*.json` (registry of running sessions)
 - the process table, through `ps` and `kill -0`
+- on `posture`: the Claude Code settings files and
+  `~/.claude.json` (only the `mcpServers` entries are used)
 
 It writes:
 
@@ -18,6 +20,8 @@ It writes:
   the previous version kept as `CLAUDE.md.claudes-bak`
 - a project's `memory/MEMORY.md` on `memory rm` and
   `memory promote --move` (the line of the removed memory)
+- Claude Code settings files on `posture --fix`, after asking,
+  each with the previous version kept as `<file>.claudes-bak`
 
 `resume` and `review` hand over to the `claude` binary with
 `exec`; from then on Claude Code's own behavior and settings

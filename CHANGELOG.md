@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `claudes posture`: report what Claude Code may do without
+  asking, from the user, managed and project settings files and
+  `~/.claude.json`: allow rules that let every command through,
+  remote shells, pushes, installs, missing deny rules, sandbox
+  off, bypass mode, configured MCP servers. `--explain` gives the
+  reason per finding, `--json` the data.
+- `posture --fix`: remove the allow rules that open everything
+  and a bypass default mode, add default deny rules for keys,
+  `.env` files, `sudo`, force push and `curl | sh`. Shows the
+  plan, asks, backs up each file.
+
 ## 0.4.0
 
 - `memory mv`: move memories to another project directory, one by

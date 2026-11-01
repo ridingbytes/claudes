@@ -67,6 +67,11 @@ a09d33b7        3d             term      Fix flaky upload test     ~/develop/api
   risky actions and prints masked findings by severity.
   `claudes review` starts a Claude Code `/security-review` in a
   session's repository.
+- **Posture.** `claudes posture` reads the settings files and
+  shows which allow rules let every command through (`Bash(*)`,
+  `Bash(python3:*)`, `Bash(ssh host *)`), whether deny rules and
+  the sandbox are set, and which MCP servers are configured.
+  `--fix` removes the open rules and adds default deny rules.
 
 Everything runs locally. `claudes` reads the files Claude Code
 already writes under `~/.claude` and sends nothing anywhere.
@@ -104,6 +109,7 @@ claudes -r api-refactor       # resume it in its own directory
 claudes rename 71c4 "release 2.4"
 claudes grep "connection pool"
 claudes audit                 # secrets and risky actions
+claudes posture --explain     # what Claude may do without asking
 claudes review api-refactor   # /security-review in that repo
 
 # clean up: unnamed sessions started in ~, idle for a month
@@ -131,6 +137,7 @@ picker opens with just those.
 | [docs/usage.md](docs/usage.md)                     | Every command and option with examples |
 | [docs/memory.md](docs/memory.md)                   | Auto memories: list, dupes, promote to CLAUDE.md |
 | [docs/audit.md](docs/audit.md)                     | What `audit` detects, severities, `review` |
+| [docs/posture.md](docs/posture.md)                 | What Claude Code may do without asking, `--fix` |
 | [docs/how-it-works.md](docs/how-it-works.md)       | Transcript format, live registry, caches |
 | [docs/security.md](docs/security.md)               | What is read and written, masking, privacy |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Missing sessions, slow scans, wrong titles |
