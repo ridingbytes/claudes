@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 
 import pytest
 
@@ -302,3 +303,23 @@ def test_caches_are_owner_only(make_session, claude_home):
     claudes.load_sessions()
     mode = os.stat(claude_home / "cache.json").st_mode & 0o777
     assert mode == 0o600
+
+
+def test_parallel_cache_writes_do_not_collide(tmp_path):
+    path = str(tmp_path / "cache.json")
+    errors = []
+
+    def write(number):
+        try:
+            for _ in range(50):
+                claudes.write_private_json(path, {"writer": number})
+        except OSError as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert os.listdir(tmp_path) == ["cache.json"]
